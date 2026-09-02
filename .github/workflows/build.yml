@@ -45,6 +45,11 @@ jobs:
         if: matrix.variant == 'medium' && runner.os == 'Windows'
         run: pip install -r requirements-win.txt
 
+      - name: Tests
+        # python -m, а не голый pytest: иначе tests/*.py не видят пакет app —
+        # его каталог добавляет в sys.path именно запуск через -m (see local repro).
+        run: python -m pytest -q -m "not slow"
+
       - name: Fetch bundled model
         run: python build/fetch_model.py ${{ matrix.variant == 'lite' && 'small' || 'medium' }}
 
@@ -54,21 +59,37 @@ jobs:
       - name: Build
         run: pyinstaller build/transkrib.spec --noconfirm --clean
 
-      # Windowed exe не блокирует консоль — ждём процесс и читаем selftest.log
+      # Windowed exe не блокирует консоль — ждём процесс и читаем selftest.log из
+      # data_dir() (папка exe бывает только для чтения, поэтому не рядом с exe).
       - name: Selftest (built exe, Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $p = Start-Process -FilePath "dist\Transkrib\Transkrib.exe" -ArgumentList "--selftest" -Wait -PassThru -WorkingDirectory (Get-Location)
-          Get-Content selftest.log
+          $log = "$env:LOCALAPPDATA\Transkrib\selftest.log"
+          Get-Content $log
           if ($p.ExitCode -ne 0) { throw "selftest exit code $($p.ExitCode)" }
-          if (-not (Select-String -Path selftest.log -Pattern "SELFTEST OK" -Quiet)) { throw "SELFTEST OK not found" }
+          if (-not (Select-String -Path $log -Pattern "SELFTEST OK" -Quiet)) { throw "SELFTEST OK not found" }
 
       - name: Selftest (built app, macOS)
         if: runner.os == 'macOS'
         run: |
           ./dist/Transkrib.app/Contents/MacOS/Transkrib --selftest
-          grep -q "SELFTEST OK" selftest.log
+          log="$HOME/Library/Application Support/Transkrib/selftest.log"
+          grep -q "SELFTEST OK" "$log"
+
+      # Проверка --check-env на собранном приложении: через консольный exe (A6),
+      # чтобы не плясать со Start-Process и файлом вывода.
+      - name: Check env (built exe, Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "dist\Transkrib\Transkrib-console.exe" --check-env
+          if ($LASTEXITCODE -ne 0) { throw "check-env exit code $LASTEXITCODE" }
+
+      - name: Check env (built app, macOS)
+        if: runner.os == 'macOS'
+        run: ./dist/Transkrib.app/Contents/MacOS/Transkrib-console --check-env
 
       - name: Package (Windows)
         if: runner.os == 'Windows'

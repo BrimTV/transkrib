@@ -200,10 +200,164 @@ class Api:
         return dict(ok=True, out=out)
 
 
+def _webview2_version():
+    """Версия WebView2 Runtime или None, если не найден. Пока заглушка: настоящую
+    проверку через winreg (app/winprep.py) добавит задача A2. Крючок для CI
+    (TRANSKRIB_FAKE_NO_WEBVIEW2) оставлен уже сейчас, чтобы --check-env можно было
+    проверить в CI до того, как A2 приземлится."""
+    if os.environ.get("TRANSKRIB_FAKE_NO_WEBVIEW2") == "1":
+        return None
+    return "неизвестно (проверка появится в A2)"
+
+
+def _dotnet_release():
+    """Release-номер .NET Framework. Заглушка, см. _webview2_version — только факт
+    в отчёте, на код выхода --check-env пока не влияет."""
+    return "неизвестно (проверка появится в A2)"
+
+
+def _run_check_env():
+    """Печатает факты окружения для диагностики и складывает их же в transkrib.log —
+    консольный exe (A6) отдаёт их пользователю без плясок со Start-Process."""
+    import ctypes
+    from . import diarize
+
+    facts = []
+
+    def rec(k, v):
+        facts.append(f"{k}={v}")
+
+    rec("version", __version__)
+    rec("platform", sys.platform)
+    rec("frozen", bool(getattr(sys, "frozen", False)))
+    meipass = getattr(sys, "_MEIPASS", None)
+    rec("meipass", meipass or "-")
+    rec("meipass_len", len(meipass) if meipass else 0)
+
+    code = 0
+    if sys.platform == "win32":
+        try:
+            acp = ctypes.windll.kernel32.GetACP()
+        except Exception as e:
+            acp = f"ошибка: {e}"
+        rec("ACP", acp)
+        wv2 = _webview2_version()
+        rec("webview2", wv2 or "не найден")
+        rec("dotnet_release", _dotnet_release() or "не найден")
+        if wv2 is None:
+            code = 3
+
+    exe = media.ffmpeg_exe()
+    rec("ffmpeg", exe)
+    rec("ffmpeg_exists", os.path.exists(exe))
+    rec("bundled_model", engine.bundled_model_key() or "-")
+    rec("models_dir", engine.models_dir())
+    rec("data_dir", engine.data_dir())
+    rec("diarize_available", diarize.available())
+    rec("diarize_model_paths", diarize.model_paths() or "-")
+
+    if meipass and len(meipass) > 170:
+        # Проводник в Windows не всегда включает длинные пути (LongPathsEnabled=0
+        # у большинства); честнее сказать пользователю сразу, а не после падения.
+        rec("warning", f"путь сборки длиннее 170 символов ({len(meipass)})")
+        code = 4
+
+    for line in facts:
+        print(line)
+    engine.log("check-env: " + "; ".join(facts))
+    return code
+
+
+def _run_smoke(argv):
+    """Для CI: создаёт настоящее окно pywebview, дожидается загрузки страницы,
+    зовёт pywebview.api.info() как это делает JS, и закрывается само. Это же
+    проверка, что мост Python↔JS вообще жив в собранном приложении."""
+    import webview
+
+    hold = 0.0
+    if "--hold" in argv:
+        try:
+            hold = float(argv[argv.index("--hold") + 1])
+        except (ValueError, IndexError):
+            hold = 0.0
+
+    log_path = os.path.join(engine.data_dir(), "smoke.log")
+    lines = []
+    ok = threading.Event()          # info() реально ответил
+    loaded_flag = threading.Event()  # событие loaded вообще наступило
+
+    def write_log():
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+    api = Api()
+
+    def finish(code):
+        # window.destroy() из фонового потока на некоторых бэкендах не будит
+        # системный цикл событий (замечено на macOS: process.run() виснет
+        # навсегда, хотя окно уже закрыто) — даём штатному выходу короткий
+        # срок и подстраховываемся принудительным os._exit, иначе CI зависнет.
+        write_log()
+        try:
+            window.destroy()
+        except Exception:
+            pass
+        t = threading.Timer(3.0, os._exit, args=(code,))
+        t.daemon = True
+        t.start()
+
+    def on_loaded():
+        loaded_flag.set()
+        lines.append("READY")
+        write_log()
+        got_info = threading.Event()
+
+        def on_info(result):
+            lines.append("OK")
+            ok.set()
+            got_info.set()
+
+        try:
+            window.evaluate_js("pywebview.api.info()", callback=on_info)
+            # evaluate_js с колбэком не блокирует до resolve промиса — ждём здесь.
+            if not got_info.wait(30):
+                lines.append("FAIL: pywebview.api.info() не ответил за 30 с")
+        except Exception as e:
+            lines.append(f"FAIL: {e}")
+        if hold > 0:
+            time.sleep(hold)
+        finish(0 if ok.is_set() else 2)
+
+    window = webview.create_window(f"Transkrib {__version__}", _ui_path(), js_api=api,
+                                   width=1100, height=740, background_color="#111418")
+    api.window = window
+    window.events.loaded += on_loaded
+
+    def watchdog():
+        # Срабатывает, только если сам loaded ни разу не наступил — иначе
+        # выходом уже занят finish().
+        if not loaded_flag.wait(90):
+            lines.append("FAIL: сторожевой таймер 90 с (loaded не наступил)")
+            write_log()
+            os._exit(2)
+
+    threading.Thread(target=watchdog, daemon=True).start()
+    webview.start(private_mode=False)
+    return 0 if ok.is_set() else 2
+
+
 def main():
+    if "--check-env" in sys.argv:
+        sys.exit(_run_check_env())
+
+    if "--smoke" in sys.argv:
+        sys.exit(_run_smoke(sys.argv))
+
     if "--selftest" in sys.argv:
-        # Для CI: без окна, результат ещё и в файл — у windowed-сборки нет stdout.
-        log_path = os.path.join(os.getcwd(), "selftest.log")
+        # Для CI: без окна, результат ещё и в файл. Папка exe бывает только для
+        # чтения — пишем в data_dir(), а не в cwd (было раньше).
+        log_path = os.path.join(engine.data_dir(), "selftest.log")
+        print(f"selftest.log: {log_path}")
         with open(log_path, "w", encoding="utf-8") as log:
             class Tee:
                 def write(self, s):

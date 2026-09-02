@@ -71,7 +71,22 @@ exe = EXE(
     console=False,
     icon=None,
 )
-coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name="Transkrib")
+# Второй exe с тем же кодом, но с консолью: пользователи и CI получают вывод
+# --cli/--check-env без Start-Process+файла. Общий _internal, +1-2 МБ к сборке.
+exe_console = EXE(
+    pyz, a.scripts, [],
+    exclude_binaries=True,
+    name="Transkrib-console",
+    debug=False,
+    strip=False,
+    upx=False,
+    console=True,
+    icon=None,
+)
+# exe (windowed) — последним: BUNDLE ниже наследует console-флаг от последнего
+# EXE в COLLECT, а windowed-режим нужен для normal .app-поведения (без него
+# BUNDLE поставит LSBackgroundOnly=True и окно не будет показываться в Dock).
+coll = COLLECT(exe_console, exe, a.binaries, a.datas, strip=False, upx=False, name="Transkrib")
 
 if IS_MAC:
     app = BUNDLE(
