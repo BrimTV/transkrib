@@ -8,6 +8,7 @@
 """
 import os
 import tarfile
+import time
 import threading
 import urllib.request
 import wave
@@ -21,7 +22,10 @@ SEG_URL = ("https://github.com/k2-fsa/sherpa-onnx/releases/download/"
 EMB_URL = ("https://github.com/k2-fsa/sherpa-onnx/releases/download/"
            "speaker-recongition-models/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx")
 SEG_FILE, EMB_FILE = "segmentation.onnx", "embedding.onnx"
-THRESHOLD = 0.6      # порог кластеризации: 0.5–0.7 давали верные 4 голоса, 0.9 склеивал
+# Подобрано 2026-09-02 на двух записях (4 голоса по 57 с; эфир на двоих, 10 мин):
+THRESHOLD = 0.65     # 0.6 дробил эфир на 15 «голосов», 0.9 склеивал двоих из четырёх
+WINDOW_SHIFT = 0.5   # шаг окна сегментации; 0.1 (дефолт) в 6 раз медленнее без выигрыша
+MINOR_SEC, MINOR_FRAC = 3.0, 0.03   # «говорящий» короче этого — обрывок, клеим к соседу
 _lock = threading.Lock()
 
 
@@ -95,26 +99,55 @@ def run(wav_path, emit, num_speakers=0, cancel=None):
     threads = max(1, min(4, (os.cpu_count() or 2) // 2))
     cfg = so.OfflineSpeakerDiarizationConfig(
         segmentation=so.OfflineSpeakerSegmentationModelConfig(
-            pyannote=so.OfflineSpeakerSegmentationPyannoteModelConfig(model=seg), num_threads=threads),
+            pyannote=so.OfflineSpeakerSegmentationPyannoteModelConfig(model=seg, window_shift_ratio=WINDOW_SHIFT),
+            num_threads=threads),
         embedding=so.SpeakerEmbeddingExtractorConfig(model=emb, num_threads=threads),
         clustering=so.FastClusteringConfig(num_clusters=num_speakers if num_speakers > 0 else -1,
                                            threshold=THRESHOLD),
-        min_duration_on=0.3, min_duration_off=0.5)
+        min_duration_on=0.5, min_duration_off=0.8)
     sd = so.OfflineSpeakerDiarization(cfg)
     samples = _read_wav(wav_path)
+
+    t0 = time.time()
 
     def progress(done, total):
         if cancel is not None and cancel.is_set():
             return -1
         if total:
-            emit(dict(type="diar_progress", progress=done / total))
+            frac = done / total
+            eta = (time.time() - t0) / frac * (1 - frac) if frac > 0.02 else None
+            emit(dict(type="diar_progress", progress=frac, eta=eta))
         return 0
 
     result = sd.process(samples, callback=progress)
+    raw = [dict(start=float(s.start), end=float(s.end), speaker=int(s.speaker))
+           for s in result.sort_by_start_time()]
+    return _finalize(raw, forced=num_speakers > 0)
+
+
+def _finalize(raw, forced=False):
+    """Обрывки-«говорящие» → ближайший по времени крупный голос; нумерация с 1
+    в порядке появления. При явно заданном числе голосов ничего не клеим."""
+    if not raw:
+        return []
+    total = {}
+    for t in raw:
+        total[t["speaker"]] = total.get(t["speaker"], 0.0) + (t["end"] - t["start"])
+    speech = sum(total.values())
+    major = {k for k, v in total.items() if v >= max(MINOR_SEC, MINOR_FRAC * speech)}
+    if forced or not major:
+        major = set(total)
+    if len(major) < len(total):
+        big = [t for t in raw if t["speaker"] in major]
+        for t in raw:
+            if t["speaker"] not in major:
+                mid = (t["start"] + t["end"]) / 2
+                near = min(big, key=lambda b: min(abs(b["start"] - mid), abs(b["end"] - mid)))
+                t["speaker"] = near["speaker"]
     order, turns = {}, []
-    for s in result.sort_by_start_time():
-        sid = order.setdefault(s.speaker, len(order) + 1)
-        turns.append(dict(start=round(float(s.start), 2), end=round(float(s.end), 2), speaker=sid))
+    for t in raw:
+        sid = order.setdefault(t["speaker"], len(order) + 1)
+        turns.append(dict(start=round(t["start"], 2), end=round(t["end"], 2), speaker=sid))
     return turns
 
 

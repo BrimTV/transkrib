@@ -22,6 +22,16 @@ from . import media
 
 APP_NAME = "Transkrib"
 
+
+def log(msg):
+    """Строка в <data_dir>/transkrib.log — единственное место, где видно, почему
+    GPU-путь упал: тост в окне живёт 4 секунды."""
+    try:
+        with open(os.path.join(data_dir(), "transkrib.log"), "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + str(msg) + "\n")
+    except Exception:
+        pass
+
 # ── модели ───────────────────────────────────────────────────────────────────
 # fw: имя репозитория CTranslate2 (faster-whisper). mlx: репозиторий mlx-community.
 MODELS = {
@@ -400,7 +410,14 @@ def transcribe_file(src, model_key, language, emit, cancel=None, prefer_gpu=True
     t_start = time.time()
     tmpdir = tempfile.mkdtemp(prefix="transkrib_")
     wav = os.path.join(tmpdir, "audio.wav")
-    diar_thread, diar_result = None, {}
+    log(f"start {src} model={model_key} lang={language} gpu={prefer_gpu} diarize={diarize}")
+
+    _emit = emit
+
+    def emit(e):
+        if e["type"] in ("stage", "done", "error", "cancelled", "speakers"):
+            log(e.get("msg") or f"{e['type']} count={e.get('count')}")
+        _emit(e)
     try:
         emit(dict(type="stage", stage="extract", msg="Извлекаю звуковую дорожку"))
         total_sec = media.extract_wav(
@@ -408,17 +425,6 @@ def transcribe_file(src, model_key, language, emit, cancel=None, prefer_gpu=True
         emit(dict(type="stage", stage="extract", msg=f"Звук готов: {_fmt_dur(total_sec)}"))
         if cancel.is_set():
             raise InterruptedError("отменено")
-
-        if diarize:
-            from . import diarize as _diar
-
-            def _run_diar():
-                try:
-                    diar_result["turns"] = _diar.run(wav, emit, num_speakers, cancel)
-                except Exception as e:
-                    diar_result["error"] = str(e)
-            diar_thread = threading.Thread(target=_run_diar, daemon=True)
-            diar_thread.start()
 
         backend = detect_backend(prefer_gpu)
         requested = model_key
@@ -438,22 +444,35 @@ def transcribe_file(src, model_key, language, emit, cancel=None, prefer_gpu=True
             except InterruptedError:
                 raise
             except Exception as e:
+                import traceback
+                log(f"{backend} FAILED on {os.path.basename(src)} model={model_key}:\n{traceback.format_exc()}")
                 if backend == "cpu":
                     raise
-                emit(dict(type="stage", stage="fallback",
-                          msg=f"{backend_label(backend)} не сработал ({str(e)[:120]}). Перехожу на процессор"))
+                emit(dict(type="stage", stage="fallback", note=True,
+                          msg=f"{backend_label(backend)} не сработал: {str(e)[:160]}. Перехожу на процессор"))
                 unload_models()
                 backend = "cpu"
-        if diar_thread is not None:
-            if diar_thread.is_alive():
-                emit(dict(type="stage", stage="diarize", msg="Текст готов, дожидаюсь разделения по говорящим"))
-            diar_thread.join()
-            if "turns" in diar_result:
-                n = len({t["speaker"] for t in diar_result["turns"]})
-                emit(dict(type="speakers", turns=diar_result["turns"], count=n))
-            else:
-                emit(dict(type="stage", stage="diarize",
-                          msg=f"Разделить по говорящим не удалось: {diar_result.get('error', '?')[:120]}"))
+        if diarize and not cancel.is_set():
+            # После текста, а не параллельно: на 8 ГБ два движка разом выбивали MLX
+            # в CPU-фолбэк (Metal не мог выделить память), а на длинных файлах
+            # диаризация ещё и тяжёлая сама по себе.
+            from . import diarize as _diar
+            avail = memory_available_gb()
+            if avail is not None and avail < 2.5:
+                unload_models()
+                log(f"unload before diarization: {avail:.1f} GB free")
+            emit(dict(type="stage", stage="diarize", msg="Текст готов, определяю говорящих"))
+            try:
+                turns = _diar.run(wav, emit, num_speakers, cancel)
+                n = len({t["speaker"] for t in turns})
+                emit(dict(type="speakers", turns=turns, count=n))
+            except InterruptedError:
+                raise
+            except Exception as e:
+                import traceback
+                log("diarization FAILED:\n" + traceback.format_exc())
+                emit(dict(type="stage", stage="diarize", note=True,
+                          msg=f"Разделить по говорящим не удалось: {str(e)[:120]}"))
         elapsed = time.time() - t_start
         emit(dict(type="done", backend=backend, elapsed=elapsed, total_sec=total_sec,
                   msg=f"Готово за {_fmt_dur(elapsed)} (скорость {total_sec / max(elapsed, 0.01):.1f}x)"))
@@ -468,9 +487,6 @@ def transcribe_file(src, model_key, language, emit, cancel=None, prefer_gpu=True
     except Exception as e:
         emit(dict(type="error", msg=f"Ошибка: {e}"))
     finally:
-        if diar_thread is not None and diar_thread.is_alive():
-            cancel.set()
-            diar_thread.join(timeout=60)
         for f in (wav,):
             try:
                 os.remove(f)

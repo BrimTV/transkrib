@@ -91,6 +91,9 @@ class Api:
         res = self.window.create_file_dialog(webview.OPEN_DIALOG, allow_multiple=True, file_types=types)
         return [p for p in (res or []) if os.path.isfile(p)]
 
+    def open_log(self):
+        self.open_folder(engine.data_dir())
+
     def open_folder(self, path):
         folder = path if os.path.isdir(path) else os.path.dirname(path)
         if sys.platform == "win32":

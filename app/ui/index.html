@@ -160,7 +160,7 @@
       <option value="0">Определить автоматически</option><option value="2">2</option><option value="3">3</option>
       <option value="4">4</option><option value="5">5</option><option value="6">6</option>
     </select></div>
-    <div class="hint" id="sDiarHint">Считается на процессоре параллельно с расшифровкой, примерно 1 минута на 10 минут записи. Имя говорящего можно поменять кликом по нему в тексте.</div>
+    <div class="hint" id="sDiarHint">Считается на процессоре после расшифровки. Имя говорящего можно поменять кликом по нему в тексте.</div>
     <h2 style="margin-top:18px;font-size:14px;color:var(--muted)">Таймкоды в TXT и MD</h2>
     <div class="row"><label>Где ставить</label><select id="sTsMode">
       <option value="none">Не ставить, только текст</option>
@@ -248,7 +248,8 @@ function renderQueue() {
     const d = document.createElement('div');
     d.className = 'item' + (current && current.id === j.id ? ' active' : '');
     const cls = { done: 'ok', error: 'err', running: 'run' }[j.status] || '';
-    d.innerHTML = `<div class="name" title="${j.path}">${j.name}</div><div class="st ${cls}">${j.msg}</div>`;
+    d.innerHTML = `<div class="name" title="${j.path}">${j.name}</div><div class="st ${cls}">${j.msg}</div>` +
+      (j.notes || []).map(n => `<div class="st" style="color:var(--warn)">⚠ ${n}</div>`).join('');
     d.onclick = () => { showJob(j); };
     q.append(d);
   }
@@ -313,7 +314,7 @@ window.onEngineEvent = function (e) {
     case 'stage':
       j.msg = e.msg; j.progress = null; j.pct = '';
       if (e.stage === 'transcribe') { j.backend = e.backend; }
-      if (e.stage === 'fallback') toast(e.msg);
+      if (e.note) { j.notes = j.notes || []; j.notes.push(e.msg); toast(e.msg); }
       break;
     case 'download':
       j.msg = 'Скачиваю модель'; j.progress = e.total ? Math.min(e.done / e.total, 1) : null;
@@ -331,7 +332,8 @@ window.onEngineEvent = function (e) {
       if (isCur) { appendSeg(seg); document.querySelectorAll('.save').forEach(b => b.disabled = false); $('#btnCopy').disabled = false; }
       break; }
     case 'diar_progress':
-      j.diar = e.progress; break;
+      j.progress = e.progress; j.pct = Math.round(e.progress * 100) + '%' + (e.eta ? ` · ещё ~${fmtT(e.eta)}` : '');
+      j.msg = 'Определяю говорящих'; break;
     case 'speakers':
       j.turns = e.turns; j.names = j.names || {};
       j.segments.forEach(s => assignOne(s, j.turns));
@@ -346,7 +348,7 @@ window.onEngineEvent = function (e) {
     case 'error':
       j.status = 'error'; j.msg = e.msg; j.progress = 0; toast(e.msg); finishJob(j, false); break;
   }
-  if (isCur) { $('#stMsg').textContent = j.msg + (j.status === 'running' && j.diar != null && j.diar < 1 ? ` · говорящие ${Math.round(j.diar * 100)}%` : ''); $('#stPct').textContent = j.pct || ''; setBar(j.progress ?? 0, j.progress == null && j.status === 'running'); }
+  if (isCur) { $('#stMsg').textContent = j.msg; $('#stPct').textContent = j.pct || ''; setBar(j.progress ?? 0, j.progress == null && j.status === 'running'); }
   renderQueue();
 };
 // ── говорящие ──────────────────────────────────────────────────────────
