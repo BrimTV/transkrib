@@ -27,17 +27,26 @@ def stamp(sec, style="brackets_short"):
     return f"[{t}]" if style.startswith("brackets") else t
 
 
+def _speaker(s):
+    v = s.get("speaker")
+    if v in (None, ""):
+        return None
+    return v if isinstance(v, str) else f"Говорящий {v}"
+
+
 def _blocks(segments, opts):
-    """Разбить сегменты на блоки [(start, [texts])] по выбранному режиму."""
+    """Разбить сегменты на блоки [(start, [texts], speaker)] по выбранному режиму.
+    Смена говорящего всегда начинает новый блок."""
     mode = opts.get("ts_mode", "paragraph")
     gap = float(opts.get("paragraph_gap", 2.5))
     step = max(5, int(opts.get("ts_interval", 60)))
-    blocks, cur, prev_end, next_mark = [], None, None, 0
+    blocks, cur, prev_end, next_mark, prev_spk = [], None, None, 0, None
     for s in segments:
         text = s["text"].strip()
         if not text:
             continue
-        new = cur is None
+        spk = _speaker(s)
+        new = cur is None or spk != prev_spk
         if mode == "segment":
             new = True
         elif mode == "interval":
@@ -48,18 +57,20 @@ def _blocks(segments, opts):
             if prev_end is not None and s["start"] - prev_end > gap:
                 new = True
         if new:
-            cur = [s["start"], []]
+            cur = [s["start"], [], spk]
             blocks.append(cur)
         cur[1].append(text)
-        prev_end = s["end"]
+        prev_end, prev_spk = s["end"], spk
     return blocks
 
 
 def to_txt(segments, opts=None):
     o = {**DEFAULT_OPTS, **(opts or {})}
     out = []
-    for start, texts in _blocks(segments, o):
+    for start, texts, spk in _blocks(segments, o):
         line = " ".join(texts)
+        if spk:
+            line = f"{spk}: {line}"
         if o["ts_mode"] != "none":
             line = f"{stamp(start, o['ts_style'])} {line}"
         out.append(line)
@@ -70,8 +81,10 @@ def to_txt(segments, opts=None):
 def to_md(segments, title=None, opts=None):
     o = {**DEFAULT_OPTS, **(opts or {})}
     lines = [f"# {title}", ""] if title else []
-    for start, texts in _blocks(segments, o):
+    for start, texts, spk in _blocks(segments, o):
         line = " ".join(texts)
+        if spk:
+            line = f"**{spk}:** {line}"
         if o["ts_mode"] != "none":
             line = f"**{stamp(start, o['ts_style'])}** {line}"
         lines.append(line)
@@ -79,17 +92,22 @@ def to_md(segments, title=None, opts=None):
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _cue_text(s):
+    spk = _speaker(s)
+    return f"{spk}: {s['text'].strip()}" if spk else s["text"].strip()
+
+
 def to_srt(segments):
     lines = []
     for i, s in enumerate(segments, 1):
-        lines += [str(i), f"{_ts(s['start'])} --> {_ts(s['end'])}", s["text"].strip(), ""]
+        lines += [str(i), f"{_ts(s['start'])} --> {_ts(s['end'])}", _cue_text(s), ""]
     return "\n".join(lines)
 
 
 def to_vtt(segments):
     lines = ["WEBVTT", ""]
     for s in segments:
-        lines += [f"{_ts(s['start'], '.')} --> {_ts(s['end'], '.')}", s["text"].strip(), ""]
+        lines += [f"{_ts(s['start'], '.')} --> {_ts(s['end'], '.')}", _cue_text(s), ""]
     return "\n".join(lines)
 
 

@@ -21,7 +21,7 @@ binaries, hiddenimports = [], []
 
 # Нативные зависимости целиком: библиотеки, данные, скрытые импорты.
 for pkg in ["ctranslate2", "faster_whisper", "av", "imageio_ffmpeg", "tokenizers",
-            "huggingface_hub", "onnxruntime", "webview"]:
+            "huggingface_hub", "onnxruntime", "webview", "sherpa_onnx", "psutil"]:
     try:
         d, b, h = collect_all(pkg)
         datas += d; binaries += b; hiddenimports += h

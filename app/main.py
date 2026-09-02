@@ -22,7 +22,8 @@ def _settings_path():
 
 DEFAULT_SETTINGS = dict(model=engine.DEFAULT_MODEL, language="ru", prefer_gpu=True,
                         autosave=True, autosave_formats=["txt", "srt"],
-                        ts_mode="paragraph", ts_interval=60, ts_style="brackets_short")
+                        ts_mode="paragraph", ts_interval=60, ts_style="brackets_short",
+                        diarize=False, num_speakers=0)
 
 
 def load_settings():
@@ -49,7 +50,7 @@ class Api:
     def _emit(self, event, job_id=None):
         # download/extract/progress летят часто — не чаще 10 раз в секунду на тип
         t = event.get("type")
-        if t in ("download", "extract", "progress"):
+        if t in ("download", "extract", "progress", "diar_progress"):
             now = time.time()
             if now - self._last_push.get(t, 0) < 0.1:
                 return
@@ -70,7 +71,9 @@ class Api:
         for key, m in engine.MODELS.items():
             models.append(dict(key=key, label=m["label"], size_mb=m["size_mb"], resolved=key,
                                cached=engine.model_is_cached(key, hw["backend"])))
+        from . import diarize
         return dict(version=__version__, hardware=hw, backend_label=engine.backend_label(hw["backend"]),
+                    diarize_available=diarize.available(), diarize_models=bool(diarize.model_paths()),
                     models=models, languages=engine.LANGUAGES, settings=load_settings(),
                     models_dir=engine.models_dir(), convert_formats=list(media.CONVERT_PRESETS))
 
@@ -98,7 +101,7 @@ class Api:
             subprocess.Popen(["xdg-open", folder])
 
     # ── расшифровка ──────────────────────────────────────────────────────
-    def start(self, job_id, path, model, language, prefer_gpu):
+    def start(self, job_id, path, model, language, prefer_gpu, diarize=False, num_speakers=0):
         if self._busy:
             return dict(ok=False, error="уже идёт задача")
         if not os.path.isfile(path):
@@ -109,7 +112,8 @@ class Api:
         def run():
             try:
                 engine.transcribe_file(path, model, language,
-                                       lambda e: self._emit(e, job_id), self._cancel, prefer_gpu)
+                                       lambda e: self._emit(e, job_id), self._cancel, prefer_gpu,
+                                       diarize=bool(diarize), num_speakers=int(num_speakers or 0))
             except Exception as e:
                 self._emit(dict(type="error", msg=f"{e}\n{traceback.format_exc()[-400:]}"), job_id)
             finally:
