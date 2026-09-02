@@ -9,3 +9,5 @@ sherpa-onnx>=1.12
 numpy
 # Сборка
 pyinstaller>=6.10
+# Тесты
+pytest>=8
