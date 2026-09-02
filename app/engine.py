@@ -8,6 +8,7 @@
 Любой сбой GPU-пути → молча переходим на cpu, пользователь видит только строку статуса.
 Все события уходят в emit(dict) — окно рисует из них прогресс и живой текст.
 """
+import contextlib
 import glob
 import logging
 import math
@@ -283,13 +284,137 @@ def _has_mlx():
         return False
 
 
-def _has_cuda():
-    _prepare_cuda_dlls()
+_cuda_diag_result = None
+_cuda_diag_lock = threading.Lock()
+
+
+def _nvidia_smi():
+    """Вывод nvidia-smi — имя карты, версия драйвера, память, вычислительная
+    способность (A4). Ищем по трём местам, как советует ТЗ: сам PATH (обычно
+    пусто — nvidia-smi туда не добавляют), затем System32 (там он есть у
+    большинства установок драйвера) и каталог NVIDIA Corporation\\NVSMI
+    (старые/нестандартные установки). Отсутствие утилиты — не ошибка: часть
+    систем её не ставит, а видеокарта при этом работает."""
+    exe = shutil.which("nvidia-smi")
+    if not exe:
+        candidates = [
+            os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "nvidia-smi.exe"),
+            os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
+                         "NVIDIA Corporation", "NVSMI", "nvidia-smi.exe"),
+        ]
+        exe = next((c for c in candidates if os.path.isfile(c)), None)
+    if not exe:
+        return None
+    try:
+        import subprocess
+        proc = subprocess.run(
+            [exe, "--query-gpu=name,driver_version,memory.total,memory.free,compute_cap",
+             "--format=csv,noheader"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=5, **media._NO_WINDOW)
+        return proc.stdout.strip() or proc.stderr.strip() or None
+    except Exception as e:
+        return f"ошибка запуска: {e}"
+
+
+def _cuda_diag():
+    """Диагностика видеокарты NVIDIA для лога и карточки «почему процессор» (A4).
+    Живого NVIDIA-железа у разработчиков нет — CUDA-путь проверят по логу первые
+    пользователи (решение владельца), поэтому эта функция обязана рассказать не
+    «не сработало», а именно что́ не так: собрана ли CUDA-упаковка сборки вообще
+    (DLL грузятся и без видеокарты — так отличаем «сломана упаковка» от «нет
+    драйвера»), драйвер старый или его нет, что видит nvidia-smi. На машине без
+    видеокарты и не на Windows обязана отработать быстро и без исключений —
+    её зовут из hardware_info(), а тот печатается в лог при каждом старте."""
+    info = dict(ctranslate2_version=None, cuda_device_count=0, compute_types=[],
+                dll_dirs=[], dll_load=None, driver_version=None, driver_msg=None,
+                nvidia_smi=None)
     try:
         import ctranslate2
-        return ctranslate2.get_cuda_device_count() > 0
+        info["ctranslate2_version"] = ctranslate2.__version__
+        n = ctranslate2.get_cuda_device_count()
+        info["cuda_device_count"] = n
+        types = []
+        for i in range(n):
+            try:
+                types.append(sorted(ctranslate2.get_supported_compute_types("cuda", i)))
+            except Exception as e:
+                types.append(f"ошибка: {e}")
+        info["compute_types"] = types
+    except Exception as e:
+        info["ctranslate2_version"] = f"ошибка: {e}"
+
+    if sys.platform != "win32":
+        return info
+
+    # Каталоги, которые _prepare_cuda_dlls добавляет в поиск DLL, и попытка их
+    # реально загрузить: если упаковка сборки не довезла cublas/cudnn (или собран
+    # неверный вариант), DLL не загрузятся даже на машине совсем без видеокарты —
+    # именно так отличаем «поломана сборка» от «нет NVIDIA».
+    _prepare_cuda_dlls()
+    roots = [getattr(sys, "_MEIPASS", None), os.path.dirname(os.path.dirname(__file__))]
+    try:
+        import site
+        roots += site.getsitepackages()
     except Exception:
-        return False
+        pass
+    dll_dirs = []
+    for root in filter(None, roots):
+        dll_dirs += glob.glob(os.path.join(root, "nvidia", "*", "bin"))
+    info["dll_dirs"] = dll_dirs
+
+    import ctypes
+    dll_load = {}
+    for name in ("cublas64_12.dll", "cublasLt64_12.dll", "cudnn64_9.dll"):
+        try:
+            ctypes.WinDLL(name)
+            dll_load[name] = "ok"
+        except OSError as e:
+            dll_load[name] = str(e)
+    info["dll_load"] = dll_load
+
+    # Версия драйвера через nvcuda.dll — она есть и грузится независимо от того,
+    # довезли ли мы cublas/cudnn: nvcuda ставит сам драйвер NVIDIA, не мы.
+    try:
+        nvcuda = ctypes.WinDLL("nvcuda.dll")
+        version = ctypes.c_int()
+        rc = nvcuda.cuDriverGetVersion(ctypes.byref(version))
+        if rc == 0:
+            info["driver_version"] = version.value
+            if version.value < 12000:
+                info["driver_msg"] = ("драйвер старее CUDA 12, нужен 527.41 или новее, "
+                                       "видеокарта не используется")
+        else:
+            info["driver_msg"] = f"cuDriverGetVersion вернул код {rc}"
+    except OSError:
+        info["driver_msg"] = "драйвера NVIDIA нет"
+    except Exception as e:
+        info["driver_msg"] = f"ошибка проверки драйвера: {e}"
+
+    info["nvidia_smi"] = _nvidia_smi()
+    return info
+
+
+def _has_cuda():
+    _prepare_cuda_dlls()
+    global _cuda_diag_result
+    try:
+        import ctranslate2
+        ok = ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        ok = False
+    # Диагностика — один раз за процесс (DLL/nvidia-smi недёшевы, а видеокарта
+    # за время работы не появляется и не исчезает): дальше используем кэш, но
+    # результат кладём в лог сразу же, чтобы объяснить, почему выбран cpu.
+    if _cuda_diag_result is None:
+        with _cuda_diag_lock:
+            if _cuda_diag_result is None:
+                try:
+                    _cuda_diag_result = _cuda_diag()
+                except Exception as e:
+                    _cuda_diag_result = {"error": str(e)}
+                log(f"cuda diag: {_cuda_diag_result}")
+    return ok
 
 
 def detect_backend(prefer_gpu=True):
@@ -332,9 +457,13 @@ def cpu_workers():
 
 
 def hardware_info():
+    # cuda=_has_cuda() до cuda_diag=_cuda_diag_result: _has_cuda() и наполняет
+    # кэш диагностики (см. её докстринг) — порядок ключей ниже важен, kwargs
+    # вычисляются слева направо.
     return dict(platform=sys.platform, machine=platform.machine(), cpu_count=os.cpu_count(),
                 physical_cpu=_physical_cpu(), mlx=_has_mlx(), cuda=_has_cuda(),
-                backend=detect_backend(), bundled_model=bundled_model_key())
+                cuda_diag=_cuda_diag_result, backend=detect_backend(),
+                bundled_model=bundled_model_key())
 
 
 # ── скачивание моделей ───────────────────────────────────────────────────────
@@ -454,8 +583,18 @@ _loaded = {}          # (backend, model_key) -> объект модели или
 _loaded_lock = threading.Lock()
 
 
-def load_model(model_key, backend, emit, cancel=None):
-    key = (backend, model_key)
+def load_model(model_key, backend, emit, cancel=None, compute_type=None):
+    """compute_type — только для backend="cuda" (ступенчатый откат A4, см.
+    transcribe_file): "auto" по умолчанию — ctranslate2 сам выбирает лучший
+    поддерживаемый тип и понижает его на старых картах вместо исключения;
+    "int8_float32" — второй, более экономный по VRAM шаг отката. Раньше тут
+    был жёстко зашит "float16": на GTX 10xx/MX/старых Quadro он не
+    поддерживается и WhisperModel бросает исключение, из-за которого мы сразу
+    и без объяснений уходили на процессор. При этом medium в float16 занимает
+    на видеокарте ≈1.5 ГБ против ≈0.8 ГБ в int8_float16 — а типичная цель,
+    вроде GTX 1650 в ноутбуках, часто имеет всего 2–4 ГБ VRAM."""
+    ct = compute_type if backend == "cuda" else None
+    key = (backend, model_key, ct)
     with _loaded_lock:
         if key in _loaded:
             return _loaded[key]
@@ -468,7 +607,12 @@ def load_model(model_key, backend, emit, cancel=None):
     else:
         from faster_whisper import WhisperModel
         if backend == "cuda":
-            obj = WhisperModel(path, device="cuda", compute_type="float16")
+            obj = WhisperModel(path, device="cuda", compute_type=ct or "auto")
+            try:
+                actual = obj.model.compute_type
+            except Exception:
+                actual = "?"
+            log(f"cuda compute_type: запрошен {ct or 'auto'}, фактический {actual}")
         else:
             workers = cpu_workers()
             log(f"cpu_threads={workers} (физических {_physical_cpu()})")
@@ -661,10 +805,61 @@ def _transcribe_mlx(model_path, wav, language, emit, cancel, total_sec, regions)
         emit(dict(type="progress", done_sec=b, total_sec=total_sec))
 
 
+@contextlib.contextmanager
+def _prevent_sleep():
+    """Не даём компьютеру уснуть на время расшифровки (Б6): часовая запись на
+    процессоре легко переживает таймер простоя ноутбука — тогда на macOS
+    App Nap придушит процесс и он резко замедлится, а на Windows система может
+    уйти в сон и задача зависнет до пробуждения. pyobjc уже в зависимостях
+    через cocoa-бэкенд pywebview, поэтому на macOS ничего доставать не нужно.
+    Снятие запрета — всегда в finally: даже если расшифровка упала с
+    исключением, сон должен вернуться в обычный режим, а не остаться
+    запрещённым до конца процесса."""
+    mac_activity = None
+    is_win = sys.platform == "win32"
+    try:
+        if sys.platform == "darwin":
+            try:
+                from Foundation import (NSProcessInfo, NSActivityIdleSystemSleepDisabled,
+                                        NSActivityUserInitiated)
+                pi = NSProcessInfo.processInfo()
+                opts = NSActivityUserInitiated | NSActivityIdleSystemSleepDisabled
+                token = pi.beginActivityWithOptions_reason_(opts, "Transkrib: расшифровка")
+                mac_activity = (pi, token)
+            except Exception as e:
+                log(f"не удалось запретить сон (macOS): {e}")
+        elif is_win:
+            # Из рабочего потока: transcribe_file и так зовётся из фонового Thread
+            # (см. app/main.py, Api.start), поэтому вызов уже идёт не из потока окна.
+            try:
+                import ctypes
+                ES_CONTINUOUS = 0x80000000
+                ES_SYSTEM_REQUIRED = 0x00000001
+                ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+            except Exception as e:
+                log(f"не удалось запретить сон (Windows): {e}")
+        yield
+    finally:
+        if mac_activity is not None:
+            try:
+                pi, token = mac_activity
+                pi.endActivity_(token)
+            except Exception as e:
+                log(f"не удалось снять запрет на сон (macOS): {e}")
+        if is_win:
+            try:
+                import ctypes
+                ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)  # ES_CONTINUOUS
+            except Exception as e:
+                log(f"не удалось снять запрет на сон (Windows): {e}")
+
+
 def transcribe_file(src, model_key, language, emit, cancel=None, prefer_gpu=True,
                     diarize=False, num_speakers=0):
     """Полный цикл: извлечь звук → модель → сегменты. Всё через emit.
-    diarize=True — параллельно считаем говорящих и в конце шлём событие speakers."""
+    diarize=True — параллельно считаем говорящих и в конце шлём событие speakers.
+    Тело обёрнуто _prevent_sleep() (Б6): на долгой задаче компьютер не должен
+    уснуть сам, иначе она зависнет или (на macOS) резко замедлится под App Nap."""
     cancel = cancel or threading.Event()
     t_start = time.time()
     tmpdir = tempfile.mkdtemp(prefix="transkrib_", dir=temp_dir())
@@ -691,114 +886,138 @@ def transcribe_file(src, model_key, language, emit, cancel=None, prefer_gpu=True
         if e["type"] in ("stage", "done", "error", "cancelled", "speakers"):
             log(e.get("msg") or f"{e['type']} count={e.get('count')}")
         _emit(e)
-    try:
-        media.check_readable(src)  # быстрая проверка до старта: файл есть, не пуст, не облачный плейсхолдер
-        emit(dict(type="stage", stage="extract", msg="Извлекаю звуковую дорожку"))
-        total_sec, audio_tracks = media.extract_wav(
-            src, wav, on_progress=lambda p: emit(dict(type="extract", progress=p)), cancel=cancel)
-        if audio_tracks > 1:
-            emit(dict(type="stage", stage="extract", note=True,
-                      msg=f"Дорожек: {audio_tracks}, взята первая"))
-        emit(dict(type="stage", stage="extract", msg=f"Звук готов: {_fmt_dur(total_sec)}"))
-        if cancel.is_set():
-            raise InterruptedError("отменено")
-
-        # Поиск речи (Б2/Б3) — один раз на весь файл, до выбора бэкенда: границы
-        # кусков одинаковы что для MLX, что для faster-whisper, и если GPU-путь
-        # ниже упадёт и мы откатимся на cpu, пересчитывать VAD незачем.
-        # Цена — примерно 1-2% длительности записи, отсюда и своя стадия прогресса.
-        emit(dict(type="stage", stage="vad", msg="Ищу речь"))
+    with _prevent_sleep():
         try:
-            regions = media.speech_regions(
-                wav, total_sec, on_progress=lambda p: emit(dict(type="vad_progress", progress=p)),
-                cancel=cancel)
+            media.check_readable(src)  # быстрая проверка до старта: файл есть, не пуст, не облачный плейсхолдер
+            emit(dict(type="stage", stage="extract", msg="Извлекаю звуковую дорожку"))
+            total_sec, audio_tracks = media.extract_wav(
+                src, wav, on_progress=lambda p: emit(dict(type="extract", progress=p)), cancel=cancel)
+            if audio_tracks > 1:
+                emit(dict(type="stage", stage="extract", note=True,
+                          msg=f"Дорожек: {audio_tracks}, взята первая"))
+            emit(dict(type="stage", stage="extract", msg=f"Звук готов: {_fmt_dur(total_sec)}"))
+            if cancel.is_set():
+                raise InterruptedError("отменено")
+
+            # Поиск речи (Б2/Б3) — один раз на весь файл, до выбора бэкенда: границы
+            # кусков одинаковы что для MLX, что для faster-whisper, и если GPU-путь
+            # ниже упадёт и мы откатимся на cpu, пересчитывать VAD незачем.
+            # Цена — примерно 1-2% длительности записи, отсюда и своя стадия прогресса.
+            emit(dict(type="stage", stage="vad", msg="Ищу речь"))
+            try:
+                regions = media.speech_regions(
+                    wav, total_sec, on_progress=lambda p: emit(dict(type="vad_progress", progress=p)),
+                    cancel=cancel)
+            except InterruptedError:
+                raise
+            except Exception as e:
+                import traceback
+                log(f"VAD FAILED, откат на резку по ffmpeg-паузам:\n{traceback.format_exc()}")
+                regions = None
+            if cancel.is_set():
+                raise InterruptedError("отменено")
+
+            backend = detect_backend(prefer_gpu)
+            # Ступенчатый откат для видеокарты (A4): "auto" — ctranslate2 сам выбирает
+            # лучший поддерживаемый тип; если исключение (в том числе нехватка VRAM
+            # прямо на первом сегменте — оно приходит не при загрузке модели, а из
+            # _transcribe_fw) — пробуем более экономный int8_float32, и только если
+            # не помогло и это, уходим на процессор. Раньше откат был не ступенчатый:
+            # любой сбой на видеокарте сразу вёл на cpu.
+            compute_type = "auto" if backend == "cuda" else None
+            requested = model_key
+            while True:
+                model_key = resolve_model(requested, backend)
+                try:
+                    if requested == "auto":
+                        emit(dict(type="stage", stage="model", msg=f"Модель: {model_key} (встроенная)"))
+                    model = load_model(model_key, backend, emit, cancel, compute_type=compute_type)
+                    emit(dict(type="stage", stage="transcribe", backend=backend,
+                              msg=f"Распознаю {backend_phrase(backend)}"))
+                    if backend == "mlx":
+                        _transcribe_mlx(model, wav, language, emit, cancel, total_sec, regions)
+                    else:
+                        _transcribe_fw(model, wav, language, backend, emit, cancel, total_sec, regions)
+                    break
+                except InterruptedError:
+                    raise
+                except Exception as e:
+                    import traceback
+                    log(f"{backend}/{compute_type} FAILED on {os.path.basename(src)} model={model_key}:\n"
+                        f"{traceback.format_exc()}")
+                    if backend == "cuda" and compute_type == "auto":
+                        emit(dict(type="stage", stage="fallback", note=True,
+                                  msg=f"Видеокарта с автовыбором типа не справилась ({str(e)[:120]}), "
+                                      f"пробую int8_float32"))
+                        unload_models()
+                        compute_type = "int8_float32"
+                        continue
+                    if backend == "cpu":
+                        raise
+                    if backend == "cuda":
+                        # Текст для карточки без техжаргона (см. правила ТЗ): дословно
+                        # то, что попросил владелец — драйвер обновить может каждый.
+                        msg = ("Видеокарта NVIDIA не сработала, считаю на процессоре. "
+                               f"Обновите драйвер NVIDIA (нужен 527 или новее) "
+                               f"(техническая деталь: {str(e)[:160]})")
+                    else:
+                        msg = f"{backend_label(backend)} не сработал: {str(e)[:160]}. Перехожу на процессор"
+                    emit(dict(type="stage", stage="fallback", note=True, msg=msg))
+                    unload_models()
+                    backend = "cpu"
+                    compute_type = None
+            if diarize and not cancel.is_set():
+                # После текста, а не параллельно: на 8 ГБ два движка разом выбивали MLX
+                # в CPU-фолбэк (Metal не мог выделить память), а на длинных файлах
+                # диаризация ещё и тяжёлая сама по себе.
+                from . import diarize as _diar
+                avail = memory_available_gb()
+                long_file = total_sec > 3600  # дольше часа — выгружаем всегда, не дожидаясь нехватки памяти
+                if long_file or (avail is not None and avail < 2.5):
+                    unload_models()
+                    log("unload before diarization: " +
+                        ("запись длиннее часа" if long_file else f"{avail:.1f} GB free"))
+                # 0.05× длительности — сложившаяся на практике оценка при шаге окна 0.5 (см. diarize.py)
+                eta = _fmt_dur(total_sec * 0.05)
+                emit(dict(type="stage", stage="diarize", msg=f"Текст готов, определяю говорящих (≈{eta})"))
+                try:
+                    turns = _diar.run_in_worker(wav, emit, num_speakers, cancel)
+                    n = len({t["speaker"] for t in turns})
+                    emit(dict(type="speakers", turns=turns, count=n))
+                except InterruptedError:
+                    raise
+                except Exception as e:
+                    import traceback
+                    log("diarization FAILED:\n" + traceback.format_exc())
+                    emit(dict(type="stage", stage="diarize", note=True,
+                              msg=f"Разделить по говорящим не удалось: {str(e)[:120]}"))
+            elapsed = time.time() - t_start
+            emit(dict(type="done", backend=backend, elapsed=elapsed, total_sec=total_sec,
+                      msg=f"Готово за {_fmt_dur(elapsed)} (скорость {total_sec / max(elapsed, 0.01):.1f}x)"))
+            global _last_used
+            _last_used = time.time()
+            avail = memory_available_gb()
+            if avail is not None and avail < LOW_MEM_GB:
+                unload_models()
+                emit(dict(type="stage", stage="unload", msg=f"Памяти мало ({avail:.1f} ГБ свободно), модель выгружена"))
         except InterruptedError:
-            raise
+            emit(dict(type="cancelled", msg="Остановлено"))
+        except UserError as e:
+            emit(dict(type="error", msg=str(e)))
         except Exception as e:
             import traceback
-            log(f"VAD FAILED, откат на резку по ffmpeg-паузам:\n{traceback.format_exc()}")
-            regions = None
-        if cancel.is_set():
-            raise InterruptedError("отменено")
-
-        backend = detect_backend(prefer_gpu)
-        requested = model_key
-        while True:
-            model_key = resolve_model(requested, backend)
+            log(f"transcribe_file FAILED on {os.path.basename(src)}:\n{traceback.format_exc()}")
+            emit(dict(type="error", msg=_friendly_error(e) or f"Не удалось обработать файл (техническая деталь: {e})"))
+        finally:
+            for f in (wav,):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
             try:
-                if requested == "auto":
-                    emit(dict(type="stage", stage="model", msg=f"Модель: {model_key} (встроенная)"))
-                model = load_model(model_key, backend, emit, cancel)
-                emit(dict(type="stage", stage="transcribe", backend=backend,
-                          msg=f"Распознаю {backend_phrase(backend)}"))
-                if backend == "mlx":
-                    _transcribe_mlx(model, wav, language, emit, cancel, total_sec, regions)
-                else:
-                    _transcribe_fw(model, wav, language, backend, emit, cancel, total_sec, regions)
-                break
-            except InterruptedError:
-                raise
-            except Exception as e:
-                import traceback
-                log(f"{backend} FAILED on {os.path.basename(src)} model={model_key}:\n{traceback.format_exc()}")
-                if backend == "cpu":
-                    raise
-                emit(dict(type="stage", stage="fallback", note=True,
-                          msg=f"{backend_label(backend)} не сработал: {str(e)[:160]}. Перехожу на процессор"))
-                unload_models()
-                backend = "cpu"
-        if diarize and not cancel.is_set():
-            # После текста, а не параллельно: на 8 ГБ два движка разом выбивали MLX
-            # в CPU-фолбэк (Metal не мог выделить память), а на длинных файлах
-            # диаризация ещё и тяжёлая сама по себе.
-            from . import diarize as _diar
-            avail = memory_available_gb()
-            long_file = total_sec > 3600  # дольше часа — выгружаем всегда, не дожидаясь нехватки памяти
-            if long_file or (avail is not None and avail < 2.5):
-                unload_models()
-                log("unload before diarization: " +
-                    ("запись длиннее часа" if long_file else f"{avail:.1f} GB free"))
-            # 0.05× длительности — сложившаяся на практике оценка при шаге окна 0.5 (см. diarize.py)
-            eta = _fmt_dur(total_sec * 0.05)
-            emit(dict(type="stage", stage="diarize", msg=f"Текст готов, определяю говорящих (≈{eta})"))
-            try:
-                turns = _diar.run_in_worker(wav, emit, num_speakers, cancel)
-                n = len({t["speaker"] for t in turns})
-                emit(dict(type="speakers", turns=turns, count=n))
-            except InterruptedError:
-                raise
-            except Exception as e:
-                import traceback
-                log("diarization FAILED:\n" + traceback.format_exc())
-                emit(dict(type="stage", stage="diarize", note=True,
-                          msg=f"Разделить по говорящим не удалось: {str(e)[:120]}"))
-        elapsed = time.time() - t_start
-        emit(dict(type="done", backend=backend, elapsed=elapsed, total_sec=total_sec,
-                  msg=f"Готово за {_fmt_dur(elapsed)} (скорость {total_sec / max(elapsed, 0.01):.1f}x)"))
-        global _last_used
-        _last_used = time.time()
-        avail = memory_available_gb()
-        if avail is not None and avail < LOW_MEM_GB:
-            unload_models()
-            emit(dict(type="stage", stage="unload", msg=f"Памяти мало ({avail:.1f} ГБ свободно), модель выгружена"))
-    except InterruptedError:
-        emit(dict(type="cancelled", msg="Остановлено"))
-    except UserError as e:
-        emit(dict(type="error", msg=str(e)))
-    except Exception as e:
-        import traceback
-        log(f"transcribe_file FAILED on {os.path.basename(src)}:\n{traceback.format_exc()}")
-        emit(dict(type="error", msg=_friendly_error(e) or f"Не удалось обработать файл (техническая деталь: {e})"))
-    finally:
-        for f in (wav,):
-            try:
-                os.remove(f)
+                os.rmdir(tmpdir)
             except OSError:
                 pass
-        try:
-            os.rmdir(tmpdir)
-        except OSError:
-            pass
 
 
 def _fmt_dur(sec):

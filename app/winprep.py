@@ -18,6 +18,7 @@ IS_WIN = sys.platform == "win32"
 _WEBVIEW2_CLSID = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
 _WEBVIEW2_DOWNLOAD_URL = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
 _DOTNET_472 = 461808  # Release для .NET Framework 4.7.2 (минимум для pythonnet)
+_LONG_PATH_LIMIT = 170  # A7: за этой длиной longPathAware не спасает без LongPathsEnabled=1
 
 
 def webview2_version():
@@ -104,3 +105,89 @@ def require_ui_runtime(interactive=True):
         except OSError:
             pass
     sys.exit(2)
+
+
+def check_install_path_length():
+    """A7: длинные пути. `longPathAware=true` в манифесте exe работает только
+    когда в реестре включена системная настройка `LongPathsEnabled=1` — у
+    большинства пользователей она выключена, и распакованная в глубокую папку
+    сборка (например, кириллический путь пользователя плюс вложенные подпапки
+    архива) откроет файлы модели с ошибкой, которую человеку не объяснить.
+    Возвращает текст для человека или None, если всё в порядке; сама решение
+    «что делать» (MessageBox, exit) не принимает — это дело main(), как и с
+    require_ui_runtime()."""
+    if not IS_WIN:
+        return None
+    base = getattr(sys, "_MEIPASS", None)
+    if not base or len(base) <= _LONG_PATH_LIMIT:
+        return None
+    return "Программа лежит слишком глубоко. Перенесите папку ближе к корню диска, например в C:\\Transkrib"
+
+
+# ── единственный экземпляр (A7) ─────────────────────────────────────────────
+# Дескриптор держим модульной переменной, а не локальной: блокировка снимается,
+# как только файл закрывается (сборщиком мусора в том числе), поэтому ссылку
+# нужно держать живой до конца процесса — ОС сама снимет lock при его смерти.
+_instance_lock_fh = None
+
+
+def _bring_existing_window_to_front(title):
+    """Windows-only: второй запуск не открывает окно заново, а поднимает уже
+    работающее — по тому же заголовку, что `create_window` ставит в
+    app/main.py (`f"Transkrib {__version__}"`). Тихо ничего не делает, если
+    окно не нашлось (например, оно ещё не успело создаться) — второй процесс
+    в этом случае просто завершится, а не покажет ложную ошибку."""
+    import ctypes
+    SW_RESTORE = 9
+    try:
+        hwnd = ctypes.windll.user32.FindWindowW(None, title)
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, SW_RESTORE)
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+
+
+def acquire_instance_lock(window_title=None):
+    """Блокировка на файле `<data_dir>/instance.lock`: не даёт открыть окно
+    дважды разом — иначе две копии грузят по 1.5 ГБ модели одновременно и
+    гоняются за одним settings.json. Дескриптор держим открытым до конца
+    процесса и не закрываем сами — ОС снимает блокировку в момент смерти
+    процесса, в том числе аварийной, сама.
+
+    Брать эту блокировку нужно только в оконном режиме (вызывающий решает
+    когда): служебные режимы — самопроверка, --cli, и особенно
+    --diarize-worker (см. app/diarize.py, A3: воркер — тот же exe,
+    перезапущенный параллельно с работающим окном) — не должны в неё
+    упираться, иначе воркер диаризации не смог бы стартовать вовсе.
+
+    Возвращает True, если блокировка захвачена этим процессом (можно
+    открывать окно), False — уже есть другой экземпляр (на Windows при False
+    дополнительно пытаемся вывести его окно на передний план по window_title)."""
+    from . import engine
+    global _instance_lock_fh
+    path = os.path.join(engine.data_dir(), "instance.lock")
+    try:
+        fh = open(path, "a+")
+    except OSError:
+        return True  # не смогли открыть файл лока — не блокируем запуск из-за диагностики
+
+    if IS_WIN:
+        import msvcrt
+        try:
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            fh.close()
+            if window_title:
+                _bring_existing_window_to_front(window_title)
+            return False
+    else:
+        import fcntl
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return False
+
+    _instance_lock_fh = fh
+    return True
