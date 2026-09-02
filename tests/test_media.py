@@ -4,7 +4,7 @@ import time
 
 import psutil
 import pytest
-import requests
+import httpx
 
 from app import engine, media
 
@@ -68,7 +68,7 @@ def test_extract_wav_multitrack_takes_first(multitrack_mkv, tmp_path):
 # ── скачивание модели без интернета (Б5) ──────────────────────────────────────
 
 def test_ensure_model_no_internet(monkeypatch, tmp_path):
-    """Подмена функции скачивания, которая бросает requests.ConnectionError —
+    """Подмена функции скачивания, которая бросает httpx.ConnectError —
     имитация настоящего отсутствия сети."""
     monkeypatch.setattr(engine, "data_dir", lambda: str(tmp_path))
 
@@ -76,10 +76,10 @@ def test_ensure_model_no_internet(monkeypatch, tmp_path):
 
     class _FakeHfApi:
         def model_info(self, *a, **k):
-            raise requests.ConnectionError("no route to host")
+            raise httpx.ConnectError("no route to host")
 
     def _fake_download(*a, **k):
-        raise requests.ConnectionError("no route to host")
+        raise httpx.ConnectError("no route to host")
 
     monkeypatch.setattr(huggingface_hub, "HfApi", _FakeHfApi)
     monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_download)

@@ -276,15 +276,17 @@ def _dir_size(path):
 
 def _looks_like_no_internet(e):
     """Похоже ли исключение при скачивании на «нет сети», а не на что-то другое."""
+    # huggingface_hub 1.x ходит в сеть через httpx, а не requests: requests у нас
+    # вообще не в зависимостях, и на чистой машине его нет (в CI на этом падали тесты).
     try:
-        import requests
-        if isinstance(e, requests.ConnectionError):
+        import httpx
+        if isinstance(e, httpx.TransportError):   # ConnectError, timeouts и прочая сеть
             return True
     except Exception:
         pass
     try:
-        from huggingface_hub.utils import LocalEntryNotFoundError
-        if isinstance(e, LocalEntryNotFoundError):
+        from huggingface_hub.errors import LocalEntryNotFoundError, OfflineModeIsEnabled
+        if isinstance(e, (LocalEntryNotFoundError, OfflineModeIsEnabled)):
             return True
     except Exception:
         pass
