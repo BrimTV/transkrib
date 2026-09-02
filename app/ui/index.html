@@ -177,9 +177,11 @@ async function init() {
   renderModelBadge();
 }
 function renderModelBadge() {
-  const m = INFO.models.find(x => x.key === SET.model);
+  const m = INFO.models.find(x => x.key === SET.model) || INFO.models[0];
+  const real = INFO.models.find(x => x.key === m.resolved) || m;
   const lang = INFO.languages.find(l => l[0] === SET.language);
-  $('#modelBadge').textContent = `${SET.model}${m && m.cached ? '' : ' (скачается)'} · ${lang ? lang[1] : SET.language}`;
+  const name = m.key === 'auto' ? `авто → ${real.key}` : m.key;
+  $('#modelBadge').textContent = `${name}${real.cached ? '' : ' (скачается)'} · ${lang ? lang[1] : SET.language}`;
 }
 
 // ── вкладки ──────────────────────────────────────────────────────────────
@@ -277,7 +279,7 @@ window.onEngineEvent = function (e) {
       if (e.stage === 'fallback') toast(e.msg);
       break;
     case 'download':
-      j.msg = `Скачиваю модель ${SET.model}`; j.progress = e.total ? Math.min(e.done / e.total, 1) : null;
+      j.msg = 'Скачиваю модель'; j.progress = e.total ? Math.min(e.done / e.total, 1) : null;
       j.pct = `${mb(e.done)} / ${mb(e.total)}`; break;
     case 'extract':
       j.msg = 'Извлекаю звук'; j.progress = e.progress; j.pct = Math.round(e.progress * 100) + '%'; break;
@@ -329,7 +331,7 @@ $('#chkTime').onchange = e => document.body.classList.toggle('notime', !e.target
 // ── настройки ────────────────────────────────────────────────────────────
 $('#btnSettings').onclick = () => {
   const sm = $('#sModel'); sm.innerHTML = '';
-  INFO.models.forEach(m => sm.append(new Option(`${m.key} — ${m.label} (${m.size_mb} МБ${m.cached ? ', скачана' : ''})`, m.key)));
+  INFO.models.forEach(m => sm.append(new Option(m.key === 'auto' ? m.label : `${m.key} — ${m.label} (${m.size_mb} МБ${m.cached ? ', скачана' : ''})`, m.key)));
   sm.value = SET.model;
   const sl = $('#sLang'); sl.innerHTML = '';
   INFO.languages.forEach(l => sl.append(new Option(l[1], l[0])));

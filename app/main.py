@@ -64,9 +64,10 @@ class Api:
     # ── справочная информация ────────────────────────────────────────────
     def info(self):
         hw = engine.hardware_info()
-        models = []
+        models = [dict(key="auto", label=engine.AUTO_LABEL, size_mb=0, cached=True,
+                       resolved=engine.resolve_model("auto", hw["backend"]))]
         for key, m in engine.MODELS.items():
-            models.append(dict(key=key, label=m["label"], size_mb=m["size_mb"],
+            models.append(dict(key=key, label=m["label"], size_mb=m["size_mb"], resolved=key,
                                cached=engine.model_is_cached(key, hw["backend"])))
         return dict(version=__version__, hardware=hw, backend_label=engine.backend_label(hw["backend"]),
                     models=models, languages=engine.LANGUAGES, settings=load_settings(),

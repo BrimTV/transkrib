@@ -41,7 +41,16 @@ MODELS = {
                            fw="Systran/faster-whisper-tiny",
                            mlx="mlx-community/whisper-tiny-mlx", size_mb=75),
 }
-DEFAULT_MODEL = "large-v3-turbo"
+DEFAULT_MODEL = "auto"
+AUTO_LABEL = "Авто — turbo на видеокарте, small на процессоре"
+
+
+def resolve_model(model_key, backend):
+    """'auto' → тяжёлая turbo только если считает видеокарта; на процессоре small,
+    иначе слабый ноутбук не потянет ни по памяти (~3 ГБ), ни по времени."""
+    if model_key != "auto":
+        return model_key
+    return "large-v3-turbo" if backend in ("mlx", "cuda") else "small"
 
 LANGUAGES = [("ru", "Русский"), ("auto", "Определить автоматически"), ("en", "English"),
              ("uk", "Українська"), ("kk", "Қазақша"), ("de", "Deutsch"), ("fr", "Français"),
@@ -316,10 +325,12 @@ def transcribe_file(src, model_key, language, emit, cancel=None, prefer_gpu=True
             raise InterruptedError("отменено")
 
         backend = detect_backend(prefer_gpu)
-        tried = []
+        requested = model_key
         while True:
-            tried.append(backend)
+            model_key = resolve_model(requested, backend)
             try:
+                if requested == "auto":
+                    emit(dict(type="stage", stage="model", msg=f"Модель: {model_key} (автовыбор под {backend_label(backend)})"))
                 model = load_model(model_key, backend, emit, cancel)
                 emit(dict(type="stage", stage="transcribe", backend=backend,
                           msg=f"Распознаю на {backend_label(backend)}"))
@@ -365,6 +376,11 @@ def _fmt_dur(sec):
 # ── самопроверка (для CI и диагностики) ──────────────────────────────────────
 def selftest(model_key="tiny"):
     """Синтетический WAV → полный цикл. Проверяет ffmpeg, модель, железо, поток событий."""
+    for stream in (sys.stdout, sys.stderr):  # консоль Windows бывает cp1252 — кириллица её роняет
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     print("hardware:", hardware_info())
     tmp = tempfile.mkdtemp(prefix="transkrib_selftest_")
     src = os.path.join(tmp, "tone.wav")

@@ -78,6 +78,8 @@ def extract_wav(src, dst, on_progress=None):
     total = probe_duration(src)
     _run(["-i", src, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", dst],
          on_progress=on_progress, total_sec=total)
+    if on_progress:
+        on_progress(1.0)  # длительность контейнера бывает больше звука — добиваем до 100%
     return wav_duration(dst)
 
 
