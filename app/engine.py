@@ -357,9 +357,24 @@ def _transcribe_fw(model, wav, language, backend, emit, cancel, total_sec):
         emit(dict(type="progress", done_sec=s.end, total_sec=total_sec))
 
 
+def _wav_slice(path, start, end):
+    """Кусок 16 кГц моно WAV → float32 массив, без ffmpeg."""
+    import numpy as np
+    with wave.open(path, "rb") as w:
+        sr = w.getframerate()
+        w.setpos(int(start * sr))
+        n = int((end - start) * sr)
+        data = w.readframes(n)
+    return np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+
+
 def _transcribe_mlx(model_path, wav, language, emit, cancel, total_sec):
     """MLX не стримит сегменты — режем файл по паузам на куски ~2 мин и отдаём
-    результат по кускам. Швы на паузах, поэтому фраз не теряем."""
+    результат по кускам. Швы на паузах, поэтому фраз не теряем.
+
+    Звук отдаём массивом, а не путём: по пути mlx_whisper зовёт `ffmpeg` из PATH,
+    а у приложения, запущенного из Finder, PATH системный и ffmpeg там нет
+    (2026-09-02, «[Errno 2] No such file or directory: 'ffmpeg'» → CPU-фолбэк)."""
     import mlx_whisper
     silences = media.silence_midpoints(wav) if total_sec > 150 else []
     bounds = [0.0] + media.cut_points(total_sec, silences) + [total_sec]
@@ -368,13 +383,9 @@ def _transcribe_mlx(model_path, wav, language, emit, cancel, total_sec):
         for i, (a, b) in enumerate(zip(bounds, bounds[1:])):
             if cancel and cancel.is_set():
                 raise InterruptedError("отменено")
-            if len(bounds) > 2:
-                piece = os.path.join(tmpdir, f"part{i}.wav")
-                media.slice_wav(wav, piece, a, b)
-            else:
-                piece = wav
+            piece = wav
             res = mlx_whisper.transcribe(
-                piece, path_or_hf_repo=model_path,
+                _wav_slice(wav, a, b), path_or_hf_repo=model_path,
                 language=None if language == "auto" else language,
                 condition_on_previous_text=False, fp16=True,
             )
@@ -390,11 +401,6 @@ def _transcribe_mlx(model_path, wav, language, emit, cancel, total_sec):
                 if text:
                     emit(dict(type="segment", start=a + s["start"], end=a + s["end"], text=text))
             emit(dict(type="progress", done_sec=b, total_sec=total_sec))
-            if piece != wav:
-                try:
-                    os.remove(piece)
-                except OSError:
-                    pass
     finally:
         try:
             os.rmdir(tmpdir)
@@ -507,6 +513,13 @@ def _fmt_dur(sec):
 # ── самопроверка (для CI и диагностики) ──────────────────────────────────────
 def selftest(model_key=None):
     model_key = model_key or bundled_model_key() or "tiny"
+    # Из Finder/проводника PATH системный: прячем внешний ffmpeg, чтобы поймать
+    # любую скрытую зависимость от него (mlx_whisper ходил за ним в PATH).
+    exe = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+    os.environ["PATH"] = os.pathsep.join(
+        d for d in os.environ.get("PATH", "").split(os.pathsep)
+        if d and not os.path.exists(os.path.join(d, exe)))
+    print("PATH без ffmpeg:", os.environ["PATH"][:120])
     """Синтетический WAV → полный цикл. Проверяет ffmpeg, модель, железо, поток событий."""
     for stream in (sys.stdout, sys.stderr):  # консоль Windows бывает cp1252 — кириллица её роняет
         try:
