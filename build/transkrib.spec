@@ -56,7 +56,12 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=[],
-    excludes=["torch", "torchaudio", "tkinter", "matplotlib", "PyQt5", "PyQt6", "PySide6", "gi"],
+    # setuptools/pkg_resources исключены намеренно: ни одна наша зависимость их в
+    # рантайме не импортирует, а рантайм-хук PyInstaller pyi_rth_pkgres падает на
+    # setuptools >= 81 («module 'pkg_resources' has no attribute 'NullProvider'») —
+    # на этом 02.09.2026 разом легли все четыре сборки в CI, когда раннер подтянул 84.
+    excludes=["torch", "torchaudio", "tkinter", "matplotlib", "PyQt5", "PyQt6", "PySide6", "gi",
+              "setuptools", "pkg_resources"],
     noarchive=False,
 )
 pyz = PYZ(a.pure)
