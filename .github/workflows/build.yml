@@ -18,11 +18,12 @@ jobs:
       fail-fast: false
       matrix:
         variant: [lite, medium]       # lite: small внутри, только CPU. medium: medium внутри, на Windows + CUDA
-        include:
+        os: [windows-latest, macos-14]   # macos-14 = Apple Silicon
+        include:                      # только добавляет поля к комбинациям, не создаёт новых
           - os: windows-latest
             name: windows-x64
             req: requirements.txt
-          - os: macos-14              # Apple Silicon
+          - os: macos-14
             name: macos-arm64
             req: requirements-mac.txt
     steps:
