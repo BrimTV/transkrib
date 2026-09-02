@@ -21,7 +21,8 @@ def _settings_path():
 
 
 DEFAULT_SETTINGS = dict(model=engine.DEFAULT_MODEL, language="ru", prefer_gpu=True,
-                        autosave=True, autosave_formats=["txt", "srt"])
+                        autosave=True, autosave_formats=["txt", "srt"],
+                        ts_mode="paragraph", ts_interval=60, ts_style="brackets_short")
 
 
 def load_settings():
@@ -122,8 +123,13 @@ class Api:
             self._cancel.set()
         return True
 
+    @staticmethod
+    def _opts():
+        s = load_settings()
+        return dict(ts_mode=s.get("ts_mode"), ts_interval=s.get("ts_interval"), ts_style=s.get("ts_style"))
+
     def render(self, segments, fmt, title=None):
-        return export.render(segments, fmt, title)
+        return export.render(segments, fmt, title, self._opts())
 
     def autosave(self, path, segments, formats):
         """Положить результат рядом с исходником. Возвращает список записанных файлов."""
@@ -132,7 +138,7 @@ class Api:
         for fmt in formats:
             out = f"{base}.{fmt}"
             with open(out, "w", encoding="utf-8") as f:
-                f.write(export.render(segments, fmt, os.path.basename(path)))
+                f.write(export.render(segments, fmt, os.path.basename(path), self._opts()))
             written.append(out)
         return written
 
@@ -143,8 +149,24 @@ class Api:
             return None
         out = res[0] if isinstance(res, (list, tuple)) else res
         with open(out, "w", encoding="utf-8") as f:
-            f.write(export.render(segments, fmt, suggested))
+            f.write(export.render(segments, fmt, suggested, self._opts()))
         return out
+
+    def memory(self):
+        return dict(available_gb=engine.memory_available_gb(), loaded=engine.models_loaded())
+
+    # ── фоновый уход за памятью ──────────────────────────────────────────
+    def start_housekeeping(self):
+        def loop():
+            while True:
+                time.sleep(30)
+                try:
+                    reason = engine.maybe_unload(self._busy)
+                    if reason:
+                        self._emit(dict(type="info", msg=reason.capitalize()))
+                except Exception:
+                    pass
+        threading.Thread(target=loop, daemon=True).start()
 
     # ── конвертер ────────────────────────────────────────────────────────
     def convert(self, job_id, path, fmt):
@@ -194,6 +216,7 @@ def main():
                                    width=1100, height=740, min_size=(820, 560),
                                    background_color="#111418")
     api.window = window
+    api.start_housekeeping()
     webview.start(private_mode=False, debug="--debug" in sys.argv)
 
 

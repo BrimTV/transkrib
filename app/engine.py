@@ -275,8 +275,57 @@ def load_model(model_key, backend, emit, cancel=None):
 
 
 def unload_models():
+    """Выгрузить всё из памяти: faster-whisper (удаляем объект), MLX (его внутренний
+    ModelHolder держит модель в классе — иначе 0.5–1.5 ГБ висят до выхода) и кэш Metal."""
+    import gc
     with _loaded_lock:
         _loaded.clear()
+    try:
+        # mlx_whisper.transcribe как атрибут — функция; сам модуль берём из sys.modules
+        _t = sys.modules.get("mlx_whisper.transcribe")
+        if _t is None:
+            raise ImportError
+        _t.ModelHolder.model = None
+        _t.ModelHolder.model_path = None
+        import mlx.core as mx
+        mx.clear_cache()
+    except Exception:
+        pass
+    gc.collect()
+
+
+def models_loaded():
+    with _loaded_lock:
+        return bool(_loaded)
+
+
+# ── бережём память ───────────────────────────────────────────────────────────
+IDLE_UNLOAD_SEC = 300      # модель без работы дольше этого — выгружаем
+LOW_MEM_GB = 1.5           # свободной памяти меньше — выгружаем сразу после задачи
+_last_used = 0.0
+
+
+def memory_available_gb():
+    try:
+        import psutil
+        return psutil.virtual_memory().available / 2 ** 30
+    except Exception:
+        return None
+
+
+def maybe_unload(busy=False):
+    """Зовётся из фонового таймера окна. Возвращает причину выгрузки или None."""
+    if busy or not models_loaded():
+        return None
+    idle = time.time() - _last_used
+    avail = memory_available_gb()
+    if idle > IDLE_UNLOAD_SEC:
+        unload_models()
+        return f"модель выгружена: простой {int(idle // 60)} мин"
+    if avail is not None and avail < LOW_MEM_GB:
+        unload_models()
+        return f"модель выгружена: свободно {avail:.1f} ГБ"
+    return None
 
 
 # ── расшифровка ──────────────────────────────────────────────────────────────
@@ -384,6 +433,12 @@ def transcribe_file(src, model_key, language, emit, cancel=None, prefer_gpu=True
         elapsed = time.time() - t_start
         emit(dict(type="done", backend=backend, elapsed=elapsed, total_sec=total_sec,
                   msg=f"Готово за {_fmt_dur(elapsed)} (скорость {total_sec / max(elapsed, 0.01):.1f}x)"))
+        global _last_used
+        _last_used = time.time()
+        avail = memory_available_gb()
+        if avail is not None and avail < LOW_MEM_GB:
+            unload_models()
+            emit(dict(type="stage", stage="unload", msg=f"Памяти мало ({avail:.1f} ГБ свободно), модель выгружена"))
     except InterruptedError:
         emit(dict(type="cancelled", msg="Остановлено"))
     except Exception as e:

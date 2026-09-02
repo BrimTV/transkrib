@@ -150,6 +150,22 @@
     <div class="row"><label>Видеокарта</label><label style="width:auto;color:var(--text)"><input type="checkbox" id="sGpu"> использовать, если есть</label></div>
     <div class="row"><label>Автосохранение</label><label style="width:auto;color:var(--text)"><input type="checkbox" id="sAuto"> класть TXT и SRT рядом с файлом</label></div>
     <div class="hint" id="sDir"></div>
+    <h2 style="margin-top:18px;font-size:14px;color:var(--muted)">Таймкоды в TXT и MD</h2>
+    <div class="row"><label>Где ставить</label><select id="sTsMode">
+      <option value="none">Не ставить, только текст</option>
+      <option value="paragraph">В начале каждого абзаца (по паузам)</option>
+      <option value="interval">Через равные промежутки</option>
+      <option value="segment">Перед каждой фразой</option>
+    </select></div>
+    <div class="row" id="rowInterval"><label>Промежуток</label><select id="sTsInt">
+      <option value="30">30 секунд</option><option value="60">1 минута</option>
+      <option value="120">2 минуты</option><option value="300">5 минут</option><option value="600">10 минут</option>
+    </select></div>
+    <div class="row"><label>Вид метки</label><select id="sTsStyle">
+      <option value="brackets_short">[3:05]</option><option value="brackets_long">[00:03:05]</option>
+      <option value="plain_short">3:05</option><option value="plain_long">00:03:05</option>
+    </select></div>
+    <div class="hint" id="sTsPreview" style="margin-left:162px"></div>
     <div class="actions"><button id="sClose">Закрыть</button><button class="primary" id="sSave">Сохранить</button></div>
   </div>
 </div>
@@ -271,6 +287,7 @@ const mb = n => (n / 1048576).toFixed(0) + ' МБ';
 // ── события из Python ────────────────────────────────────────────────────
 window.onEngineEvent = function (e) {
   if (e.type.startsWith('convert_')) return onConvertEvent(e);
+  if (e.type === 'info') return toast(e.msg);
   const j = jobs.find(x => x.id === e.job); if (!j) return;
   const isCur = current && current.id === j.id;
   switch (e.type) {
@@ -342,12 +359,25 @@ $('#btnSettings').onclick = () => {
     ? 'На процессоре: turbo примерно в реальном времени, large-v3 в 3–5 раз медленнее записи.'
     : 'На видеокарте любая модель быстрее реального времени, берите turbo или large-v3.';
   $('#sDir').textContent = 'Модели хранятся в: ' + INFO.models_dir;
+  $('#sTsMode').value = SET.ts_mode || 'paragraph'; $('#sTsInt').value = String(SET.ts_interval || 60);
+  $('#sTsStyle').value = SET.ts_style || 'brackets_short';
+  tsPreview();
   $('#modal').classList.add('show');
 };
+function tsPreview() {
+  const mode = $('#sTsMode').value, st = $('#sTsStyle').value;
+  $('#rowInterval').style.display = mode === 'interval' ? '' : 'none';
+  const mk = s => { const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60, p = v => String(v).padStart(2, '0');
+    const t = st.endsWith('_long') ? `${p(h)}:${p(m)}:${p(x)}` : (h ? `${h}:${p(m)}:${p(x)}` : `${m}:${p(x)}`);
+    return st.startsWith('brackets') ? `[${t}]` : t; };
+  $('#sTsPreview').textContent = mode === 'none' ? 'Пример: Привет, это проверка…' : `Пример: ${mk(185)} Привет, это проверка…`;
+}
+['#sTsMode', '#sTsStyle'].forEach(sel => $(sel).onchange = tsPreview);
 $('#sClose').onclick = () => $('#modal').classList.remove('show');
 $('#sSave').onclick = async () => {
   SET = await pywebview.api.set_settings({ model: $('#sModel').value, language: $('#sLang').value,
-    prefer_gpu: $('#sGpu').checked, autosave: $('#sAuto').checked });
+    prefer_gpu: $('#sGpu').checked, autosave: $('#sAuto').checked,
+    ts_mode: $('#sTsMode').value, ts_interval: Number($('#sTsInt').value), ts_style: $('#sTsStyle').value });
   INFO.settings = SET; renderModelBadge(); $('#modal').classList.remove('show');
 };
 
