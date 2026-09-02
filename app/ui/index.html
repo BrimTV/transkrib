@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Transkrib</title>
+<style>
+  :root {
+    --bg: #111418; --panel: #191d23; --panel2: #20252c; --line: #2b323b;
+    --text: #e6e9ee; --muted: #8a94a3; --accent: #4f8cff; --accent2: #3ddc97;
+    --warn: #ffb454; --err: #ff6b6b; --radius: 12px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 14px/1.45 -apple-system, "Segoe UI", system-ui, Roboto, sans-serif; overflow: hidden; }
+  body { display: flex; flex-direction: column; }
+  header { display: flex; align-items: center; gap: 14px; padding: 12px 18px; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 17px; margin: 0; font-weight: 600; letter-spacing: .2px; }
+  .badge { font-size: 12px; padding: 3px 9px; border-radius: 999px; background: var(--panel2); color: var(--muted); border: 1px solid var(--line); }
+  .badge.gpu { color: var(--accent2); border-color: #2a5c47; }
+  .tabs { display: flex; gap: 4px; margin-left: 12px; }
+  .tab { padding: 6px 14px; border-radius: 8px; cursor: pointer; color: var(--muted); user-select: none; }
+  .tab.active { background: var(--panel2); color: var(--text); }
+  .spacer { flex: 1; }
+  button { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 8px;
+    padding: 7px 13px; cursor: pointer; font: inherit; font-size: 13px; }
+  button:hover { border-color: #3c4652; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { color: var(--err); }
+  button:disabled { opacity: .45; cursor: default; }
+  select, input[type=text] { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; font: inherit; }
+  main { flex: 1; display: none; min-height: 0; }
+  main.active { display: flex; }
+  .left { width: 340px; min-width: 300px; border-right: 1px solid var(--line); display: flex; flex-direction: column; }
+  .right { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .drop { margin: 14px; padding: 26px 16px; border: 2px dashed var(--line); border-radius: var(--radius);
+    text-align: center; color: var(--muted); cursor: pointer; transition: .15s; }
+  .drop:hover, .drop.over { border-color: var(--accent); color: var(--text); background: #171c25; }
+  .drop b { color: var(--text); display: block; font-size: 15px; margin-bottom: 4px; }
+  .queue { flex: 1; overflow-y: auto; padding: 0 14px 14px; }
+  .item { padding: 10px 12px; border-radius: 10px; background: var(--panel); border: 1px solid var(--line); margin-bottom: 8px; cursor: pointer; }
+  .item.active { border-color: var(--accent); }
+  .item .name { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .item .st { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .item .st.ok { color: var(--accent2); } .item .st.err { color: var(--err); } .item .st.run { color: var(--accent); }
+  .status { padding: 12px 18px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  .status .msg { display: flex; justify-content: space-between; color: var(--muted); font-size: 13px; margin-bottom: 8px; }
+  .bar { height: 6px; background: var(--panel2); border-radius: 999px; overflow: hidden; }
+  .bar i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), var(--accent2)); transition: width .25s; }
+  .bar.indet i { width: 30%; animation: slide 1.2s infinite linear; }
+  @keyframes slide { from { transform: translateX(-100%);} to { transform: translateX(400%);} }
+  .toolbar { display: flex; gap: 8px; align-items: center; padding: 10px 18px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .toolbar .lbl { color: var(--muted); font-size: 12px; margin-right: 4px; }
+  .transcript { flex: 1; overflow-y: auto; padding: 14px 22px 40px; font-size: 15px; line-height: 1.6; }
+  .seg { display: flex; gap: 12px; padding: 3px 0; animation: fade .3s; }
+  .seg .t { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; min-width: 56px; padding-top: 4px; user-select: none; }
+  .seg .x { flex: 1; }
+  body.notime .seg .t { display: none; }
+  body.notime .seg { display: inline; padding: 0; } body.notime .seg .x { display: inline; } body.notime .seg .x::after { content: " "; }
+  @keyframes fade { from { opacity: 0; transform: translateY(4px);} to { opacity: 1; transform: none;} }
+  .empty { color: var(--muted); text-align: center; margin-top: 80px; }
+  .cursor { display: inline-block; width: 8px; height: 16px; background: var(--accent); vertical-align: text-bottom; animation: blink 1s infinite; margin-left: 4px; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .toast { position: fixed; bottom: 18px; right: 18px; background: var(--panel2); border: 1px solid var(--line); padding: 10px 14px; border-radius: 10px; font-size: 13px; opacity: 0; transition: .3s; pointer-events: none; max-width: 480px; }
+  .toast.show { opacity: 1; }
+  /* модалка настроек */
+  .modal { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none; align-items: center; justify-content: center; }
+  .modal.show { display: flex; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 20px 22px; width: 520px; max-width: 92vw; }
+  .card h2 { margin: 0 0 14px; font-size: 16px; }
+  .row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+  .row label { width: 150px; color: var(--muted); font-size: 13px; }
+  .row select { flex: 1; }
+  .hint { color: var(--muted); font-size: 12px; margin: -6px 0 12px 162px; }
+  .card .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+  /* конвертер */
+  .conv { flex: 1; display: flex; flex-direction: column; }
+  .conv .list { flex: 1; overflow-y: auto; padding: 0 18px 18px; }
+  .conv .item { cursor: default; display: flex; align-items: center; gap: 12px; }
+  .conv .item .name { flex: 1; }
+  .conv .bar { width: 160px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Transkrib</h1>
+  <span class="badge" id="hw">…</span>
+  <div class="tabs">
+    <div class="tab active" data-tab="tr">Расшифровка</div>
+    <div class="tab" data-tab="cv">Конвертер</div>
+  </div>
+  <div class="spacer"></div>
+  <span class="badge" id="modelBadge">…</span>
+  <button id="btnSettings">Настройки</button>
+</header>
+
+<!-- ───────── Расшифровка ───────── -->
+<main id="tab-tr" class="active">
+  <div class="left">
+    <div class="drop" id="dropTr">
+      <b>Перетащите сюда аудио или видео</b>
+      или нажмите, чтобы выбрать файл<br>
+      <small>mp4, mkv, mov, mp3, wav, m4a, ogg, flac и другие</small>
+    </div>
+    <div class="queue" id="queue"></div>
+  </div>
+  <div class="right">
+    <div class="status">
+      <div class="msg"><span id="stMsg">Готов к работе</span><span id="stPct"></span></div>
+      <div class="bar" id="bar"><i></i></div>
+    </div>
+    <div class="toolbar">
+      <button id="btnCancel" class="danger" disabled>Остановить</button>
+      <span class="lbl" style="margin-left:8px">Сохранить:</span>
+      <button data-fmt="txt" class="save" disabled>TXT</button>
+      <button data-fmt="srt" class="save" disabled>SRT</button>
+      <button data-fmt="vtt" class="save" disabled>VTT</button>
+      <button data-fmt="md" class="save" disabled>MD</button>
+      <button id="btnCopy" disabled>Копировать текст</button>
+      <button id="btnFolder" disabled>Открыть папку</button>
+      <div class="spacer"></div>
+      <label style="color:var(--muted);font-size:12px;cursor:pointer"><input type="checkbox" id="chkTime" checked> таймкоды</label>
+    </div>
+    <div class="transcript" id="transcript"><div class="empty">Текст появится здесь по мере распознавания</div></div>
+  </div>
+</main>
+
+<!-- ───────── Конвертер ───────── -->
+<main id="tab-cv">
+  <div class="conv">
+    <div class="drop" id="dropCv" style="margin:18px">
+      <b>Перетащите файлы для конвертации</b>
+      или нажмите, чтобы выбрать
+    </div>
+    <div class="toolbar">
+      <span class="lbl">Во что:</span>
+      <select id="cvFmt"></select>
+      <span class="lbl" style="margin-left:10px">Файл сохранится рядом с исходником</span>
+    </div>
+    <div class="list" id="cvList"></div>
+  </div>
+</main>
+
+<!-- ───────── Настройки ───────── -->
+<div class="modal" id="modal">
+  <div class="card">
+    <h2>Настройки</h2>
+    <div class="row"><label>Модель</label><select id="sModel"></select></div>
+    <div class="hint" id="sModelHint"></div>
+    <div class="row"><label>Язык речи</label><select id="sLang"></select></div>
+    <div class="row"><label>Видеокарта</label><label style="width:auto;color:var(--text)"><input type="checkbox" id="sGpu"> использовать, если есть</label></div>
+    <div class="row"><label>Автосохранение</label><label style="width:auto;color:var(--text)"><input type="checkbox" id="sAuto"> класть TXT и SRT рядом с файлом</label></div>
+    <div class="hint" id="sDir"></div>
+    <div class="actions"><button id="sClose">Закрыть</button><button class="primary" id="sSave">Сохранить</button></div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+let INFO = null, SET = null;
+let jobs = [];          // {id, path, name, status, segments, backend, elapsed}
+let current = null;     // текущий job
+let running = false;
+let cvJobs = {};
+
+// ── инициализация ────────────────────────────────────────────────────────
+window.addEventListener('pywebviewready', init);
+async function init() {
+  INFO = await pywebview.api.info();
+  SET = INFO.settings;
+  const hw = $('#hw');
+  hw.textContent = INFO.backend_label;
+  hw.className = 'badge' + (INFO.hardware.backend !== 'cpu' ? ' gpu' : '');
+  const fm = $('#cvFmt');
+  INFO.convert_formats.forEach(f => fm.append(new Option(f.toUpperCase(), f)));
+  fm.value = 'mp3';
+  renderModelBadge();
+}
+function renderModelBadge() {
+  const m = INFO.models.find(x => x.key === SET.model);
+  const lang = INFO.languages.find(l => l[0] === SET.language);
+  $('#modelBadge').textContent = `${SET.model}${m && m.cached ? '' : ' (скачается)'} · ${lang ? lang[1] : SET.language}`;
+}
+
+// ── вкладки ──────────────────────────────────────────────────────────────
+document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
+  document.querySelectorAll('.tab').forEach(x => x.classList.toggle('active', x === t));
+  document.querySelectorAll('main').forEach(m => m.classList.toggle('active', m.id === 'tab-' + t.dataset.tab));
+});
+
+// ── drag & drop и выбор файлов ───────────────────────────────────────────
+function wireDrop(el, onFiles) {
+  el.onclick = async () => { const p = await pywebview.api.pick_files(); if (p && p.length) onFiles(p); };
+  ['dragenter', 'dragover'].forEach(ev => el.addEventListener(ev, e => { e.preventDefault(); el.classList.add('over'); }));
+  ['dragleave', 'drop'].forEach(ev => el.addEventListener(ev, e => { e.preventDefault(); el.classList.remove('over'); }));
+  el.addEventListener('drop', e => {
+    const paths = [...e.dataTransfer.files].map(f => f.pywebviewFullPath).filter(Boolean);
+    if (paths.length) onFiles(paths);
+    else toast('Не удалось получить путь к файлу — нажмите на область и выберите файл');
+  });
+}
+document.addEventListener('dragover', e => e.preventDefault());
+document.addEventListener('drop', e => e.preventDefault());
+wireDrop($('#dropTr'), addToQueue);
+wireDrop($('#dropCv'), addToConvert);
+
+// ── очередь расшифровки ──────────────────────────────────────────────────
+function addToQueue(paths) {
+  for (const p of paths) {
+    if (jobs.some(j => j.path === p && j.status !== 'done' && j.status !== 'error')) continue;
+    jobs.push({ id: 'j' + Date.now() + Math.random().toString(36).slice(2, 6), path: p,
+      name: p.split(/[\\/]/).pop(), status: 'queued', segments: [], msg: 'В очереди' });
+  }
+  renderQueue(); pump();
+}
+function renderQueue() {
+  const q = $('#queue'); q.innerHTML = '';
+  for (const j of jobs) {
+    const d = document.createElement('div');
+    d.className = 'item' + (current && current.id === j.id ? ' active' : '');
+    const cls = { done: 'ok', error: 'err', running: 'run' }[j.status] || '';
+    d.innerHTML = `<div class="name" title="${j.path}">${j.name}</div><div class="st ${cls}">${j.msg}</div>`;
+    d.onclick = () => { showJob(j); };
+    q.append(d);
+  }
+}
+async function pump() {
+  if (running) return;
+  const next = jobs.find(j => j.status === 'queued');
+  if (!next) return;
+  running = true;
+  next.status = 'running'; next.msg = 'Запуск…';
+  showJob(next);
+  const r = await pywebview.api.start(next.id, next.path, SET.model, SET.language, SET.prefer_gpu);
+  if (!r.ok) { next.status = 'error'; next.msg = r.error; running = false; renderQueue(); pump(); }
+  $('#btnCancel').disabled = false;
+}
+function showJob(j) {
+  current = j;
+  renderQueue();
+  const tr = $('#transcript'); tr.innerHTML = '';
+  if (!j.segments.length) tr.innerHTML = `<div class="empty">${j.status === 'running' ? 'Слушаю…' : 'Пока пусто'}</div>`;
+  else j.segments.forEach(s => appendSeg(s, false));
+  if (j.status === 'running') tr.insertAdjacentHTML('beforeend', '<span class="cursor" id="cur"></span>');
+  const has = j.segments.length > 0;
+  document.querySelectorAll('.save').forEach(b => b.disabled = !has);
+  $('#btnCopy').disabled = !has; $('#btnFolder').disabled = false;
+  $('#stMsg').textContent = j.msg; $('#stPct').textContent = j.pct || '';
+  setBar(j.progress ?? 0, j.status === 'running' && j.progress == null);
+}
+function fmtT(s) { s = Math.floor(s); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
+  return (h ? h + ':' : '') + String(m).padStart(2, '0') + ':' + String(x).padStart(2, '0'); }
+function appendSeg(s, scroll = true) {
+  const tr = $('#transcript'); const e = $('.empty'); if (e) e.remove();
+  const cur = $('#cur');
+  const d = document.createElement('div'); d.className = 'seg';
+  d.innerHTML = `<span class="t">${fmtT(s.start)}</span><span class="x"></span>`;
+  d.querySelector('.x').textContent = s.text;
+  if (cur) tr.insertBefore(d, cur); else tr.append(d);
+  if (scroll && tr.scrollHeight - tr.scrollTop - tr.clientHeight < 200) tr.scrollTop = tr.scrollHeight;
+}
+function setBar(p, indet) {
+  const b = $('#bar'); b.classList.toggle('indet', !!indet);
+  b.querySelector('i').style.width = indet ? '' : Math.round(p * 100) + '%';
+}
+const mb = n => (n / 1048576).toFixed(0) + ' МБ';
+
+// ── события из Python ────────────────────────────────────────────────────
+window.onEngineEvent = function (e) {
+  if (e.type.startsWith('convert_')) return onConvertEvent(e);
+  const j = jobs.find(x => x.id === e.job); if (!j) return;
+  const isCur = current && current.id === j.id;
+  switch (e.type) {
+    case 'stage':
+      j.msg = e.msg; j.progress = null; j.pct = '';
+      if (e.stage === 'transcribe') { j.backend = e.backend; }
+      if (e.stage === 'fallback') toast(e.msg);
+      break;
+    case 'download':
+      j.msg = `Скачиваю модель ${SET.model}`; j.progress = e.total ? Math.min(e.done / e.total, 1) : null;
+      j.pct = `${mb(e.done)} / ${mb(e.total)}`; break;
+    case 'extract':
+      j.msg = 'Извлекаю звук'; j.progress = e.progress; j.pct = Math.round(e.progress * 100) + '%'; break;
+    case 'progress':
+      j.progress = e.total_sec ? Math.min(e.done_sec / e.total_sec, 1) : null;
+      j.pct = `${fmtT(e.done_sec)} / ${fmtT(e.total_sec)}`;
+      j.msg = `Распознаю на ${j.backend === 'cpu' ? 'процессоре' : 'видеокарте'}`; break;
+    case 'segment':
+      j.segments.push({ start: e.start, end: e.end, text: e.text });
+      if (isCur) { appendSeg(e); document.querySelectorAll('.save').forEach(b => b.disabled = false); $('#btnCopy').disabled = false; }
+      break;
+    case 'done':
+      j.status = 'done'; j.msg = e.msg; j.progress = 1; j.pct = fmtT(e.total_sec);
+      finishJob(j); break;
+    case 'cancelled':
+      j.status = 'error'; j.msg = 'Остановлено'; j.progress = 0; finishJob(j, false); break;
+    case 'error':
+      j.status = 'error'; j.msg = e.msg; j.progress = 0; toast(e.msg); finishJob(j, false); break;
+  }
+  if (isCur) { $('#stMsg').textContent = j.msg; $('#stPct').textContent = j.pct || ''; setBar(j.progress ?? 0, j.progress == null && j.status === 'running'); }
+  renderQueue();
+};
+async function finishJob(j, ok = true) {
+  running = false; $('#btnCancel').disabled = true;
+  const c = $('#cur'); if (c) c.remove();
+  if (ok && SET.autosave && j.segments.length) {
+    try { const w = await pywebview.api.autosave(j.path, j.segments, SET.autosave_formats || ['txt', 'srt']);
+      toast('Сохранено: ' + w.map(x => x.split(/[\\/]/).pop()).join(', ')); } catch (err) { toast('Не удалось сохранить: ' + err); }
+  }
+  pump();
+}
+
+// ── кнопки ───────────────────────────────────────────────────────────────
+$('#btnCancel').onclick = () => pywebview.api.cancel();
+document.querySelectorAll('.save').forEach(b => b.onclick = async () => {
+  if (!current) return;
+  const out = await pywebview.api.save_as(current.segments, b.dataset.fmt, current.name.replace(/\.[^.]+$/, ''));
+  if (out) toast('Сохранено: ' + out);
+});
+$('#btnCopy').onclick = async () => {
+  if (!current) return;
+  const txt = await pywebview.api.render(current.segments, 'txt');
+  try { await navigator.clipboard.writeText(txt); toast('Текст скопирован'); }
+  catch { const ta = document.createElement('textarea'); ta.value = txt; document.body.append(ta); ta.select(); document.execCommand('copy'); ta.remove(); toast('Текст скопирован'); }
+};
+$('#btnFolder').onclick = () => current && pywebview.api.open_folder(current.path);
+$('#chkTime').onchange = e => document.body.classList.toggle('notime', !e.target.checked);
+
+// ── настройки ────────────────────────────────────────────────────────────
+$('#btnSettings').onclick = () => {
+  const sm = $('#sModel'); sm.innerHTML = '';
+  INFO.models.forEach(m => sm.append(new Option(`${m.key} — ${m.label} (${m.size_mb} МБ${m.cached ? ', скачана' : ''})`, m.key)));
+  sm.value = SET.model;
+  const sl = $('#sLang'); sl.innerHTML = '';
+  INFO.languages.forEach(l => sl.append(new Option(l[1], l[0])));
+  sl.value = SET.language;
+  $('#sGpu').checked = !!SET.prefer_gpu; $('#sAuto').checked = !!SET.autosave;
+  $('#sModelHint').textContent = INFO.hardware.backend === 'cpu'
+    ? 'На процессоре: turbo примерно в реальном времени, large-v3 в 3–5 раз медленнее записи.'
+    : 'На видеокарте любая модель быстрее реального времени, берите turbo или large-v3.';
+  $('#sDir').textContent = 'Модели хранятся в: ' + INFO.models_dir;
+  $('#modal').classList.add('show');
+};
+$('#sClose').onclick = () => $('#modal').classList.remove('show');
+$('#sSave').onclick = async () => {
+  SET = await pywebview.api.set_settings({ model: $('#sModel').value, language: $('#sLang').value,
+    prefer_gpu: $('#sGpu').checked, autosave: $('#sAuto').checked });
+  INFO.settings = SET; renderModelBadge(); $('#modal').classList.remove('show');
+};
+
+// ── конвертер ────────────────────────────────────────────────────────────
+async function addToConvert(paths) {
+  const fmt = $('#cvFmt').value;
+  for (const p of paths) {
+    const id = 'c' + Date.now() + Math.random().toString(36).slice(2, 6);
+    const d = document.createElement('div'); d.className = 'item'; d.id = id;
+    d.innerHTML = `<div class="name">${p.split(/[\\/]/).pop()} → ${fmt.toUpperCase()}</div><div class="bar"><i></i></div><div class="st">0%</div>`;
+    $('#cvList').prepend(d);
+    cvJobs[id] = { path: p };
+    const r = await pywebview.api.convert(id, p, fmt);
+    if (!r.ok) { d.querySelector('.st').textContent = r.error; d.querySelector('.st').className = 'st err'; }
+  }
+}
+function onConvertEvent(e) {
+  const d = document.getElementById(e.job); if (!d) return;
+  const st = d.querySelector('.st'), bar = d.querySelector('.bar i');
+  if (e.type === 'convert_progress') { bar.style.width = Math.round(e.progress * 100) + '%'; st.textContent = Math.round(e.progress * 100) + '%'; }
+  if (e.type === 'convert_done') { bar.style.width = '100%'; st.textContent = 'Готово'; st.className = 'st ok';
+    const b = document.createElement('button'); b.textContent = 'Открыть папку'; b.onclick = () => pywebview.api.open_folder(e.out); d.append(b); }
+  if (e.type === 'convert_error') { st.textContent = e.msg; st.className = 'st err'; }
+}
+
+let toastT;
+function toast(m) { const t = $('#toast'); t.textContent = m; t.classList.add('show'); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('show'), 4000); }
+</script>
+</body>
+</html>

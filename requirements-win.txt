@@ -1,0 +1,5 @@
+-r requirements.txt
+# CUDA-рантайм для faster-whisper/ctranslate2 4.x: CUDA 12 + cuDNN 9.
+# Кладётся внутрь сборки, системный CUDA не нужен. Без NVIDIA просто не используется.
+nvidia-cublas-cu12; sys_platform == "win32"
+nvidia-cudnn-cu12>=9,<10; sys_platform == "win32"

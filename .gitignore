@@ -1,0 +1,12 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+dist/
+build/Transkrib/
+build/*/
+*.spec.bak
+selftest.log
+.DS_Store
+.omc/
+test_media/

@@ -1,0 +1,394 @@
+"""Движок расшифровки: выбор железа, скачивание модели, потоковая выдача сегментов.
+
+Три пути, по убыванию предпочтения:
+  mlx  — Apple Silicon, GPU через mlx-whisper (перенесено из VK-Vibe unpack/transcribe.py)
+  cuda — Windows/Linux с NVIDIA, faster-whisper на CUDA (float16)
+  cpu  — везде, faster-whisper int8 (тот же режим, что CPU-фолбэк в VK-Vibe)
+
+Любой сбой GPU-пути → молча переходим на cpu, пользователь видит только строку статуса.
+Все события уходят в emit(dict) — окно рисует из них прогресс и живой текст.
+"""
+import glob
+import math
+import os
+import platform
+import sys
+import tempfile
+import threading
+import time
+import wave
+
+from . import media
+
+APP_NAME = "Transkrib"
+
+# ── модели ───────────────────────────────────────────────────────────────────
+# fw: имя репозитория CTranslate2 (faster-whisper). mlx: репозиторий mlx-community.
+MODELS = {
+    "large-v3-turbo": dict(label="Большая turbo — лучший баланс, рекомендуется",
+                           fw="mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+                           mlx="mlx-community/whisper-large-v3-turbo", size_mb=1600),
+    "large-v3":       dict(label="Большая v3 — максимум качества, медленно на CPU",
+                           fw="Systran/faster-whisper-large-v3",
+                           mlx="mlx-community/whisper-large-v3-mlx", size_mb=3100),
+    "medium":         dict(label="Средняя — хорошее качество, умеренная скорость",
+                           fw="Systran/faster-whisper-medium",
+                           mlx="mlx-community/whisper-medium-mlx", size_mb=1500),
+    "small":          dict(label="Маленькая — быстро, для черновиков",
+                           fw="Systran/faster-whisper-small",
+                           mlx="mlx-community/whisper-small-mlx", size_mb=480),
+    "tiny":           dict(label="Крошечная — мгновенно, качество слабое",
+                           fw="Systran/faster-whisper-tiny",
+                           mlx="mlx-community/whisper-tiny-mlx", size_mb=75),
+}
+DEFAULT_MODEL = "large-v3-turbo"
+
+LANGUAGES = [("ru", "Русский"), ("auto", "Определить автоматически"), ("en", "English"),
+             ("uk", "Українська"), ("kk", "Қазақша"), ("de", "Deutsch"), ("fr", "Français"),
+             ("es", "Español"), ("it", "Italiano"), ("pt", "Português"), ("tr", "Türkçe"),
+             ("zh", "中文"), ("ja", "日本語")]
+
+
+def data_dir():
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    d = os.path.join(base, APP_NAME)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def models_dir():
+    d = os.path.join(data_dir(), "models")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+# ── железо ───────────────────────────────────────────────────────────────────
+_cuda_prepared = False
+
+
+def _prepare_cuda_dlls():
+    """Windows: cublas/cudnn лежат в pip-пакетах nvidia-*, а не в системе.
+    ctranslate2 найдёт их только если папки добавлены в поиск DLL ДО импорта."""
+    global _cuda_prepared
+    if _cuda_prepared or sys.platform != "win32":
+        return
+    _cuda_prepared = True
+    roots = [getattr(sys, "_MEIPASS", None), os.path.dirname(os.path.dirname(__file__))]
+    try:
+        import site
+        roots += site.getsitepackages()
+    except Exception:
+        pass
+    for root in filter(None, roots):
+        for d in glob.glob(os.path.join(root, "nvidia", "*", "bin")):
+            try:
+                os.add_dll_directory(d)
+            except Exception:
+                pass
+            os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+
+
+def _has_mlx():
+    if sys.platform != "darwin" or platform.machine() != "arm64":
+        return False
+    try:
+        import mlx_whisper  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _has_cuda():
+    _prepare_cuda_dlls()
+    try:
+        import ctranslate2
+        return ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        return False
+
+
+def detect_backend(prefer_gpu=True):
+    """'mlx' | 'cuda' | 'cpu'."""
+    if prefer_gpu:
+        if _has_mlx():
+            return "mlx"
+        if _has_cuda():
+            return "cuda"
+    return "cpu"
+
+
+def backend_label(b):
+    return {"mlx": "GPU Apple Silicon (MLX)", "cuda": "GPU NVIDIA (CUDA)",
+            "cpu": "Процессор"}.get(b, b)
+
+
+def hardware_info():
+    return dict(platform=sys.platform, machine=platform.machine(), cpu_count=os.cpu_count(),
+                mlx=_has_mlx(), cuda=_has_cuda(), backend=detect_backend())
+
+
+# ── скачивание моделей ───────────────────────────────────────────────────────
+def _repo_for(model_key, backend):
+    return MODELS[model_key]["mlx" if backend == "mlx" else "fw"]
+
+
+_FW_PATTERNS = ["config.json", "preprocessor_config.json", "model.bin", "tokenizer.json",
+                "vocabulary.*", "generation_config.json"]
+
+
+def model_is_cached(model_key, backend):
+    from huggingface_hub import try_to_load_from_cache
+    repo = _repo_for(model_key, backend)
+    probe = "config.json"
+    r = try_to_load_from_cache(repo, probe, cache_dir=models_dir())
+    return isinstance(r, str) and os.path.exists(r)
+
+
+def _dir_size(path):
+    total = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
+def ensure_model(model_key, backend, emit, cancel=None):
+    """Скачать модель, если её нет. Прогресс — опросом размера папки кэша:
+    у huggingface_hub нет нормального колбэка на байты."""
+    from huggingface_hub import snapshot_download, HfApi
+    repo = _repo_for(model_key, backend)
+    patterns = None if backend == "mlx" else _FW_PATTERNS
+    if model_is_cached(model_key, backend):
+        return snapshot_download(repo, cache_dir=models_dir(), allow_patterns=patterns,
+                                 local_files_only=True)
+
+    emit(dict(type="stage", stage="download", msg=f"Скачиваю модель «{model_key}» (один раз)"))
+    total = None
+    try:
+        info = HfApi().model_info(repo, files_metadata=True)
+        import fnmatch
+        total = sum((s.size or 0) for s in info.siblings
+                    if patterns is None or any(fnmatch.fnmatch(s.rfilename, p) for p in patterns))
+    except Exception:
+        total = MODELS[model_key]["size_mb"] * 1024 * 1024
+
+    cache_sub = os.path.join(models_dir(), "models--" + repo.replace("/", "--"))
+    result, error = {}, {}
+
+    def worker():
+        try:
+            result["path"] = snapshot_download(repo, cache_dir=models_dir(), allow_patterns=patterns)
+        except Exception as e:
+            error["e"] = e
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    while t.is_alive():
+        if cancel and cancel.is_set():
+            raise InterruptedError("отменено")
+        done = _dir_size(cache_sub) if os.path.isdir(cache_sub) else 0
+        emit(dict(type="download", done=done, total=total))
+        t.join(0.5)
+    if "e" in error:
+        raise RuntimeError(f"не удалось скачать модель {repo}: {error['e']}")
+    emit(dict(type="download", done=total, total=total))
+    return result["path"]
+
+
+# ── загрузка модели (кэш в памяти) ───────────────────────────────────────────
+_loaded = {}          # (backend, model_key) -> объект модели или путь (для mlx)
+_loaded_lock = threading.Lock()
+
+
+def load_model(model_key, backend, emit, cancel=None):
+    key = (backend, model_key)
+    with _loaded_lock:
+        if key in _loaded:
+            return _loaded[key]
+    path = ensure_model(model_key, backend, emit, cancel)
+    emit(dict(type="stage", stage="load", msg=f"Загружаю модель в память ({backend_label(backend)})"))
+    t0 = time.time()
+    if backend == "mlx":
+        obj = path  # mlx_whisper грузит сам при первом вызове и кэширует внутри
+    else:
+        from faster_whisper import WhisperModel
+        if backend == "cuda":
+            obj = WhisperModel(path, device="cuda", compute_type="float16")
+        else:
+            obj = WhisperModel(path, device="cpu", compute_type="int8",
+                               cpu_threads=max(1, (os.cpu_count() or 4)))
+    with _loaded_lock:
+        _loaded.clear()   # держим в памяти одну модель: они по 1.5–3 ГБ
+        _loaded[key] = obj
+    emit(dict(type="stage", stage="load", msg=f"Модель готова за {time.time() - t0:.1f} с"))
+    return obj
+
+
+def unload_models():
+    with _loaded_lock:
+        _loaded.clear()
+
+
+# ── расшифровка ──────────────────────────────────────────────────────────────
+def _transcribe_fw(model, wav, language, backend, emit, cancel, total_sec):
+    segments, info = model.transcribe(
+        wav, language=None if language == "auto" else language,
+        beam_size=5 if backend == "cuda" else 1,
+        vad_filter=True, vad_parameters=dict(min_silence_duration_ms=500),
+        condition_on_previous_text=False,
+    )
+    if language == "auto":
+        emit(dict(type="stage", stage="lang", msg=f"Язык: {info.language} ({info.language_probability:.0%})"))
+    for s in segments:
+        if cancel and cancel.is_set():
+            raise InterruptedError("отменено")
+        text = s.text.strip()
+        if text:
+            emit(dict(type="segment", start=s.start, end=s.end, text=text))
+        emit(dict(type="progress", done_sec=s.end, total_sec=total_sec))
+
+
+def _transcribe_mlx(model_path, wav, language, emit, cancel, total_sec):
+    """MLX не стримит сегменты — режем файл по паузам на куски ~2 мин и отдаём
+    результат по кускам. Швы на паузах, поэтому фраз не теряем."""
+    import mlx_whisper
+    silences = media.silence_midpoints(wav) if total_sec > 150 else []
+    bounds = [0.0] + media.cut_points(total_sec, silences) + [total_sec]
+    tmpdir = tempfile.mkdtemp(prefix="transkrib_")
+    try:
+        for i, (a, b) in enumerate(zip(bounds, bounds[1:])):
+            if cancel and cancel.is_set():
+                raise InterruptedError("отменено")
+            if len(bounds) > 2:
+                piece = os.path.join(tmpdir, f"part{i}.wav")
+                media.slice_wav(wav, piece, a, b)
+            else:
+                piece = wav
+            res = mlx_whisper.transcribe(
+                piece, path_or_hf_repo=model_path,
+                language=None if language == "auto" else language,
+                condition_on_previous_text=False, fp16=True,
+            )
+            try:
+                import mlx.core as mx
+                mx.clear_cache()   # иначе буферный кэш растёт на каждую новую длину куска
+            except Exception:
+                pass
+            if i == 0 and language == "auto":
+                emit(dict(type="stage", stage="lang", msg=f"Язык: {res.get('language')}"))
+            for s in res.get("segments", []):
+                text = (s.get("text") or "").strip()
+                if text:
+                    emit(dict(type="segment", start=a + s["start"], end=a + s["end"], text=text))
+            emit(dict(type="progress", done_sec=b, total_sec=total_sec))
+            if piece != wav:
+                try:
+                    os.remove(piece)
+                except OSError:
+                    pass
+    finally:
+        try:
+            os.rmdir(tmpdir)
+        except OSError:
+            pass
+
+
+def transcribe_file(src, model_key, language, emit, cancel=None, prefer_gpu=True):
+    """Полный цикл: извлечь звук → модель → сегменты. Всё через emit."""
+    cancel = cancel or threading.Event()
+    t_start = time.time()
+    tmpdir = tempfile.mkdtemp(prefix="transkrib_")
+    wav = os.path.join(tmpdir, "audio.wav")
+    try:
+        emit(dict(type="stage", stage="extract", msg="Извлекаю звуковую дорожку"))
+        total_sec = media.extract_wav(
+            src, wav, on_progress=lambda p: emit(dict(type="extract", progress=p)))
+        emit(dict(type="stage", stage="extract", msg=f"Звук готов: {_fmt_dur(total_sec)}"))
+        if cancel.is_set():
+            raise InterruptedError("отменено")
+
+        backend = detect_backend(prefer_gpu)
+        tried = []
+        while True:
+            tried.append(backend)
+            try:
+                model = load_model(model_key, backend, emit, cancel)
+                emit(dict(type="stage", stage="transcribe", backend=backend,
+                          msg=f"Распознаю на {backend_label(backend)}"))
+                if backend == "mlx":
+                    _transcribe_mlx(model, wav, language, emit, cancel, total_sec)
+                else:
+                    _transcribe_fw(model, wav, language, backend, emit, cancel, total_sec)
+                break
+            except InterruptedError:
+                raise
+            except Exception as e:
+                if backend == "cpu":
+                    raise
+                emit(dict(type="stage", stage="fallback",
+                          msg=f"{backend_label(backend)} не сработал ({str(e)[:120]}). Перехожу на процессор"))
+                unload_models()
+                backend = "cpu"
+        elapsed = time.time() - t_start
+        emit(dict(type="done", backend=backend, elapsed=elapsed, total_sec=total_sec,
+                  msg=f"Готово за {_fmt_dur(elapsed)} (скорость {total_sec / max(elapsed, 0.01):.1f}x)"))
+    except InterruptedError:
+        emit(dict(type="cancelled", msg="Остановлено"))
+    except Exception as e:
+        emit(dict(type="error", msg=f"Ошибка: {e}"))
+    finally:
+        for f in (wav,):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        try:
+            os.rmdir(tmpdir)
+        except OSError:
+            pass
+
+
+def _fmt_dur(sec):
+    sec = int(round(sec))
+    h, m, s = sec // 3600, (sec % 3600) // 60, sec % 60
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+# ── самопроверка (для CI и диагностики) ──────────────────────────────────────
+def selftest(model_key="tiny"):
+    """Синтетический WAV → полный цикл. Проверяет ffmpeg, модель, железо, поток событий."""
+    print("hardware:", hardware_info())
+    tmp = tempfile.mkdtemp(prefix="transkrib_selftest_")
+    src = os.path.join(tmp, "tone.wav")
+    with wave.open(src, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(22050)
+        frames = bytearray()
+        for i in range(22050 * 3):
+            v = int(8000 * math.sin(2 * math.pi * 440 * i / 22050))
+            frames += int(v).to_bytes(2, "little", signed=True)
+        w.writeframes(bytes(frames))
+    events = []
+
+    def emit(e):
+        events.append(e)
+        if e["type"] in ("stage", "done", "error", "segment", "cancelled"):
+            print(e)
+    transcribe_file(src, model_key, "ru", emit)
+    ok = any(e["type"] == "done" for e in events)
+    print("SELFTEST", "OK" if ok else "FAILED")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(selftest())
+    if len(sys.argv) > 1:
+        transcribe_file(sys.argv[1], DEFAULT_MODEL, "ru", lambda e: print(e))
