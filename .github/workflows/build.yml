@@ -242,7 +242,11 @@ jobs:
             Set-Content -Path $_.FullName -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3"
           }
           $marked = (Get-ChildItem -Path motw_check -Recurse -Include *.dll | Select-Object -First 1).FullName
+          $markedExe = "motw_check\Transkrib\Transkrib-console.exe"
           Write-Host "помечено, пример: $marked"
+          if (-not (Get-Item -Path $markedExe -Stream Zone.Identifier -ErrorAction SilentlyContinue)) {
+            throw "проверка бессмысленна: exe не помечен"
+          }
           & "motw_check\Transkrib\Transkrib-console.exe" --check-env
           if ($LASTEXITCODE -ne 0) { throw "с пометкой из интернета не запустилось, код $LASTEXITCODE" }
           $left = Get-Item -Path $marked -Stream Zone.Identifier -ErrorAction SilentlyContinue

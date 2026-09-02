@@ -51,11 +51,16 @@ def _unblock_mark_of_the_web():
     meipass = getattr(sys, "_MEIPASS", None)
     if not meipass:
         return None
-    marker = os.path.join(meipass, "webview", "lib", "Python.Runtime.dll") + ":Zone.Identifier"
-    if not os.path.exists(marker):
+    # Признак ищем на самом exe, а не на конкретной библиотеке: путь к ней зависит
+    # от версии пакета (в webview/lib лежат только сборки WebView2, а Python.Runtime.dll
+    # приходит из pythonnet и живёт в другом месте — из-за этого проверка молча не
+    # срабатывала, поймано проверкой в CI 02.09.2026). Exe Проводник помечает всегда.
+    if not os.path.exists(sys.executable + ":Zone.Identifier"):
         return None
+    # Чистим весь каталог сборки: exe лежат рядом с _internal, на уровень выше.
+    root_dir = os.path.dirname(sys.executable) or meipass
     cleaned = failed = 0
-    for root, _, files in os.walk(meipass):
+    for root, _, files in os.walk(root_dir):
         for name in files:
             if os.path.splitext(name)[1].lower() not in (".dll", ".pyd", ".exe"):
                 continue
