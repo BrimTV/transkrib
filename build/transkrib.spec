@@ -10,6 +10,13 @@ IS_WIN = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
 
 datas = [(os.path.join(ROOT, "app", "ui"), os.path.join("app", "ui"))]
+# Встроенная модель: build/fetch_model.py <key> кладёт её в bundled_models/
+BUNDLED = os.path.join(ROOT, "bundled_models")
+if os.path.isdir(BUNDLED):
+    datas.append((BUNDLED, "bundled_models"))
+    print(f"[spec] встраиваю модели из {BUNDLED}")
+else:
+    print("[spec] bundled_models/ нет — сборка без встроенной модели (модель скачается при первом запуске)")
 binaries, hiddenimports = [], []
 
 # Нативные зависимости целиком: библиотеки, данные, скрытые импорты.

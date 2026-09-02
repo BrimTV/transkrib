@@ -243,7 +243,7 @@ function showJob(j) {
   const tr = $('#transcript'); tr.innerHTML = '';
   if (!j.segments.length) tr.innerHTML = `<div class="empty">${j.status === 'running' ? 'Слушаю…' : 'Пока пусто'}</div>`;
   else j.segments.forEach(s => appendSeg(s, false));
-  if (j.status === 'running') tr.insertAdjacentHTML('beforeend', '<span class="cursor" id="cur"></span>');
+  if (j.status === 'running' && j.segments.length) tr.insertAdjacentHTML('beforeend', '<span class="cursor" id="cur"></span>');
   const has = j.segments.length > 0;
   document.querySelectorAll('.save').forEach(b => b.disabled = !has);
   $('#btnCopy').disabled = !has; $('#btnFolder').disabled = false;
@@ -258,7 +258,8 @@ function appendSeg(s, scroll = true) {
   const d = document.createElement('div'); d.className = 'seg';
   d.innerHTML = `<span class="t">${fmtT(s.start)}</span><span class="x"></span>`;
   d.querySelector('.x').textContent = s.text;
-  if (cur) tr.insertBefore(d, cur); else tr.append(d);
+  if (cur) tr.insertBefore(d, cur);
+  else { tr.append(d); if (current && current.status === 'running') tr.insertAdjacentHTML('beforeend', '<span class="cursor" id="cur"></span>'); }
   if (scroll && tr.scrollHeight - tr.scrollTop - tr.clientHeight < 200) tr.scrollTop = tr.scrollHeight;
 }
 function setBar(p, indet) {

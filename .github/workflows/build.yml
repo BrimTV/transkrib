@@ -12,16 +12,17 @@ on:
 
 jobs:
   build:
-    name: ${{ matrix.name }}
+    name: ${{ matrix.variant }} / ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        variant: [lite, medium]       # lite: small внутри, только CPU. medium: medium внутри, на Windows + CUDA
         include:
           - os: windows-latest
             name: windows-x64
-            req: requirements-win.txt
-          - os: macos-14          # Apple Silicon runner
+            req: requirements.txt
+          - os: macos-14              # Apple Silicon
             name: macos-arm64
             req: requirements-mac.txt
     steps:
@@ -31,14 +32,22 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: ${{ matrix.req }}
+          cache-dependency-path: |
+            requirements*.txt
 
       - name: Install
         run: |
           python -m pip install --upgrade pip
           pip install -r ${{ matrix.req }}
 
-      - name: Selftest (source)
+      - name: Install CUDA runtime (medium, Windows)
+        if: matrix.variant == 'medium' && runner.os == 'Windows'
+        run: pip install -r requirements-win.txt
+
+      - name: Fetch bundled model
+        run: python build/fetch_model.py ${{ matrix.variant == 'lite' && 'small' || 'medium' }}
+
+      - name: Selftest (source, bundled model)
         run: python -m app.engine --selftest
 
       - name: Build
@@ -64,20 +73,20 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Compress-Archive -Path dist\Transkrib -DestinationPath Transkrib-${{ matrix.name }}.zip
-          Get-Item Transkrib-${{ matrix.name }}.zip | Select-Object Name, @{n="MB";e={[math]::Round($_.Length/1MB)}}
+          7z a -tzip -mx=3 Transkrib-${{ matrix.variant }}-${{ matrix.name }}.zip .\dist\Transkrib | Out-Null
+          Get-Item Transkrib-*.zip | Select-Object Name, @{n="MB";e={[math]::Round($_.Length/1MB)}}
 
       - name: Package (macOS)
         if: runner.os == 'macOS'
         run: |
           codesign --force --deep -s - dist/Transkrib.app
-          ditto -c -k --keepParent dist/Transkrib.app Transkrib-${{ matrix.name }}.zip
-          ls -la Transkrib-${{ matrix.name }}.zip
+          ditto -c -k --keepParent dist/Transkrib.app Transkrib-${{ matrix.variant }}-${{ matrix.name }}.zip
+          ls -la Transkrib-*.zip
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Transkrib-${{ matrix.name }}
-          path: Transkrib-${{ matrix.name }}.zip
+          name: Transkrib-${{ matrix.variant }}-${{ matrix.name }}
+          path: Transkrib-${{ matrix.variant }}-${{ matrix.name }}.zip
           compression-level: 0
 
   release:

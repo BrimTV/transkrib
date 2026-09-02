@@ -25,32 +25,53 @@ APP_NAME = "Transkrib"
 # ── модели ───────────────────────────────────────────────────────────────────
 # fw: имя репозитория CTranslate2 (faster-whisper). mlx: репозиторий mlx-community.
 MODELS = {
-    "large-v3-turbo": dict(label="Большая turbo — лучший баланс, рекомендуется",
-                           fw="mobiuslabsgmbh/faster-whisper-large-v3-turbo",
-                           mlx="mlx-community/whisper-large-v3-turbo", size_mb=1600),
-    "large-v3":       dict(label="Большая v3 — максимум качества, медленно на CPU",
-                           fw="Systran/faster-whisper-large-v3",
-                           mlx="mlx-community/whisper-large-v3-mlx", size_mb=3100),
-    "medium":         dict(label="Средняя — хорошее качество, умеренная скорость",
-                           fw="Systran/faster-whisper-medium",
-                           mlx="mlx-community/whisper-medium-mlx", size_mb=1500),
-    "small":          dict(label="Маленькая — быстро, для черновиков",
+    "small":          dict(label="Лёгкая — быстро даже на слабом ноутбуке",
                            fw="Systran/faster-whisper-small",
                            mlx="mlx-community/whisper-small-mlx", size_mb=480),
+    "medium":         dict(label="Средняя — заметно точнее, в 2–3 раза медленнее",
+                           fw="Systran/faster-whisper-medium",
+                           mlx="mlx-community/whisper-medium-mlx", size_mb=1500),
+    "large-v3-turbo": dict(label="Большая turbo — для видеокарты, догружается отдельно",
+                           fw="mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+                           mlx="mlx-community/whisper-large-v3-turbo", size_mb=1600),
     "tiny":           dict(label="Крошечная — мгновенно, качество слабое",
                            fw="Systran/faster-whisper-tiny",
                            mlx="mlx-community/whisper-tiny-mlx", size_mb=75),
 }
 DEFAULT_MODEL = "auto"
-AUTO_LABEL = "Авто — turbo на видеокарте, small на процессоре"
+
+
+# ── встроенная модель (кладётся в сборку build/fetch_model.py) ───────────────
+def bundled_root():
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, "bundled_models")
+
+
+def bundled_model_key():
+    """Ключ модели, вшитой в эту сборку, или None (запуск из исходников без bundled_models)."""
+    try:
+        import json
+        with open(os.path.join(bundled_root(), "variant.json"), encoding="utf-8") as f:
+            return json.load(f).get("model")
+    except Exception:
+        return None
+
+
+def bundled_model_path(model_key, backend):
+    kind = "mlx" if backend == "mlx" else "fw"
+    p = os.path.join(bundled_root(), model_key, kind)
+    return p if os.path.isfile(os.path.join(p, "config.json")) else None
 
 
 def resolve_model(model_key, backend):
-    """'auto' → тяжёлая turbo только если считает видеокарта; на процессоре small,
-    иначе слабый ноутбук не потянет ни по памяти (~3 ГБ), ни по времени."""
+    """'auto' → встроенная в сборку модель; из исходников — small."""
     if model_key != "auto":
         return model_key
-    return "large-v3-turbo" if backend in ("mlx", "cuda") else "small"
+    return bundled_model_key() or "small"
+
+
+def auto_label():
+    return f"Встроенная — {resolve_model('auto', 'cpu')}, без скачивания"
 
 LANGUAGES = [("ru", "Русский"), ("auto", "Определить автоматически"), ("en", "English"),
              ("uk", "Українська"), ("kk", "Қазақша"), ("de", "Deutsch"), ("fr", "Français"),
@@ -136,9 +157,16 @@ def backend_label(b):
             "cpu": "Процессор"}.get(b, b)
 
 
+def backend_phrase(b):
+    """Для фраз вида «Распознаю на …»."""
+    return {"mlx": "на GPU Apple Silicon (MLX)", "cuda": "на видеокарте NVIDIA (CUDA)",
+            "cpu": "на процессоре"}.get(b, b)
+
+
 def hardware_info():
     return dict(platform=sys.platform, machine=platform.machine(), cpu_count=os.cpu_count(),
-                mlx=_has_mlx(), cuda=_has_cuda(), backend=detect_backend())
+                mlx=_has_mlx(), cuda=_has_cuda(), backend=detect_backend(),
+                bundled_model=bundled_model_key())
 
 
 # ── скачивание моделей ───────────────────────────────────────────────────────
@@ -151,6 +179,8 @@ _FW_PATTERNS = ["config.json", "preprocessor_config.json", "model.bin", "tokeniz
 
 
 def model_is_cached(model_key, backend):
+    if bundled_model_path(model_key, backend):
+        return True
     from huggingface_hub import try_to_load_from_cache
     repo = _repo_for(model_key, backend)
     probe = "config.json"
@@ -173,6 +203,9 @@ def ensure_model(model_key, backend, emit, cancel=None):
     """Скачать модель, если её нет. Прогресс — опросом размера папки кэша:
     у huggingface_hub нет нормального колбэка на байты."""
     from huggingface_hub import snapshot_download, HfApi
+    bundled = bundled_model_path(model_key, backend)
+    if bundled:
+        return bundled
     repo = _repo_for(model_key, backend)
     patterns = None if backend == "mlx" else _FW_PATTERNS
     if model_is_cached(model_key, backend):
@@ -223,7 +256,7 @@ def load_model(model_key, backend, emit, cancel=None):
         if key in _loaded:
             return _loaded[key]
     path = ensure_model(model_key, backend, emit, cancel)
-    emit(dict(type="stage", stage="load", msg=f"Загружаю модель в память ({backend_label(backend)})"))
+    emit(dict(type="stage", stage="load", msg=f"Загружаю модель {model_key} в память"))
     t0 = time.time()
     if backend == "mlx":
         obj = path  # mlx_whisper грузит сам при первом вызове и кэширует внутри
@@ -330,10 +363,10 @@ def transcribe_file(src, model_key, language, emit, cancel=None, prefer_gpu=True
             model_key = resolve_model(requested, backend)
             try:
                 if requested == "auto":
-                    emit(dict(type="stage", stage="model", msg=f"Модель: {model_key} (автовыбор под {backend_label(backend)})"))
+                    emit(dict(type="stage", stage="model", msg=f"Модель: {model_key} (встроенная)"))
                 model = load_model(model_key, backend, emit, cancel)
                 emit(dict(type="stage", stage="transcribe", backend=backend,
-                          msg=f"Распознаю на {backend_label(backend)}"))
+                          msg=f"Распознаю {backend_phrase(backend)}"))
                 if backend == "mlx":
                     _transcribe_mlx(model, wav, language, emit, cancel, total_sec)
                 else:
@@ -374,7 +407,8 @@ def _fmt_dur(sec):
 
 
 # ── самопроверка (для CI и диагностики) ──────────────────────────────────────
-def selftest(model_key="tiny"):
+def selftest(model_key=None):
+    model_key = model_key or bundled_model_key() or "tiny"
     """Синтетический WAV → полный цикл. Проверяет ffmpeg, модель, железо, поток событий."""
     for stream in (sys.stdout, sys.stderr):  # консоль Windows бывает cp1252 — кириллица её роняет
         try:

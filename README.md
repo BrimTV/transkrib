@@ -9,8 +9,11 @@
   в том числе вытащить звук из видео.
 - **Железо:** Windows с NVIDIA считает на видеокарте (CUDA), Mac на Apple Silicon на GPU (MLX).
   Без видеокарты работает на процессоре. Переключение автоматическое, с запасным путём на CPU.
-- **Модель:** Whisper large-v3-turbo по умолчанию, качается один раз (1.6 ГБ). Есть выбор
-  large-v3, medium, small, tiny.
+- **Две сборки, модель уже внутри, ничего не качается:**
+  - `lite` — Whisper small, только процессор. Работает на любом ноутбуке, архив самый маленький.
+  - `medium` — Whisper medium, точнее и в 2–3 раза медленнее. На Windows внутри ещё CUDA-библиотеки,
+    так что с NVIDIA считает на видеокарте.
+  В настройках можно догрузить large-v3-turbo (1.6 ГБ), это имеет смысл только с видеокартой.
 
 Основано на логике расшифровки из VK-Vibe (`unpack/transcribe.py`): mlx-whisper на маке,
 faster-whisper как CPU-путь, резка длинных записей по паузам через ffmpeg.
@@ -20,11 +23,11 @@ faster-whisper как CPU-путь, резка длинных записей п�
 Готовые архивы собирает GitHub Actions (вкладка Actions → последняя сборка → Artifacts,
 или Releases для тегов `v*`).
 
-**Windows.** Распаковать `Transkrib-windows-x64.zip`, запустить `Transkrib\Transkrib.exe`.
+**Windows.** Распаковать `Transkrib-lite-windows-x64.zip` (или `medium`), запустить `Transkrib\Transkrib.exe`.
 Нужен Windows 10/11 с WebView2 (есть в системе по умолчанию). CUDA ставить не надо,
 библиотеки внутри. При первом запуске SmartScreen может спросить: «Подробнее → Выполнить в любом случае».
 
-**macOS (Apple Silicon).** Распаковать `Transkrib-macos-arm64.zip`, перетащить `Transkrib.app`
+**macOS (Apple Silicon).** Распаковать `Transkrib-lite-macos-arm64.zip` (или `medium`), перетащить `Transkrib.app`
 в Программы. Приложение не подписано сертификатом разработчика, поэтому при первом запуске
 правой кнопкой → Открыть. Если система пишет «повреждено», снять карантин:
 
@@ -49,8 +52,11 @@ python -m app.engine --selftest
 ## Сборка
 
 ```bash
+python build/fetch_model.py small        # или medium: модель ляжет в bundled_models/
 pyinstaller build/transkrib.spec --noconfirm --clean
 ```
+
+Без `bundled_models/` сборка тоже соберётся, но модель скачается при первом запуске.
 
 Результат в `dist/Transkrib` (Windows) или `dist/Transkrib.app` (macOS).
 
@@ -68,5 +74,6 @@ app/media.py    ffmpeg: извлечение звука, конвертация,
 app/export.py   txt / srt / vtt / md
 app/main.py     окно pywebview и мост Python ↔ JS
 app/ui/         интерфейс (один html-файл)
-build/          spec для PyInstaller
+build/          spec для PyInstaller и fetch_model.py для вшивания модели
+bundled_models/ встроенная модель (создаётся fetch_model.py, в git не попадает)
 ```

@@ -10,3 +10,4 @@ selftest.log
 .DS_Store
 .omc/
 test_media/
+bundled_models/
