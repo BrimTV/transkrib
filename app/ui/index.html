@@ -42,6 +42,8 @@
   .item .name { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .item .st { font-size: 12px; color: var(--muted); margin-top: 2px; }
   .item .st.ok { color: var(--accent2); } .item .st.err { color: var(--err); } .item .st.run { color: var(--accent); }
+  .item .actions { display: flex; gap: 6px; margin-top: 6px; }
+  .item .actions button { padding: 3px 9px; font-size: 12px; }
   .status { padding: 12px 18px; border-bottom: 1px solid var(--line); background: var(--panel); }
   .status .msg { display: flex; justify-content: space-between; color: var(--muted); font-size: 13px; margin-bottom: 8px; }
   .bar { height: 6px; background: var(--panel2); border-radius: 999px; overflow: hidden; }
@@ -114,6 +116,7 @@
     </div>
     <div class="toolbar">
       <button id="btnCancel" class="danger" disabled>Остановить</button>
+      <button id="btnResumeQueue" style="display:none">Продолжить очередь</button>
       <span class="lbl" style="margin-left:8px">Сохранить:</span>
       <button data-fmt="txt" class="save" disabled>TXT</button>
       <button data-fmt="srt" class="save" disabled>SRT</button>
@@ -154,6 +157,7 @@
     <div class="row"><label>Видеокарта</label><label style="width:auto;color:var(--text)"><input type="checkbox" id="sGpu"> использовать, если есть</label></div>
     <div class="row"><label>Автосохранение</label><label style="width:auto;color:var(--text)"><input type="checkbox" id="sAuto"> класть TXT и SRT рядом с файлом</label></div>
     <div class="hint" id="sDir"></div>
+    <div class="row"><label>Диагностика</label><button id="btnOpenLogSettings">Открыть лог</button></div>
     <h2 style="margin-top:18px;font-size:14px;color:var(--muted)">Говорящие</h2>
     <div class="row"><label>Разделять</label><label style="width:auto;color:var(--text)"><input type="checkbox" id="sDiar"> определять, кто говорит</label></div>
     <div class="row" id="rowSpk"><label>Сколько голосов</label><select id="sSpk">
@@ -188,6 +192,8 @@ let INFO = null, SET = null;
 let jobs = [];          // {id, path, name, status, segments, backend, elapsed}
 let current = null;     // текущий job
 let running = false;
+let queuePaused = false;   // true после «Остановить» — остальные queued сами не стартуют
+let summaryShown = false;  // итоговый тост «Готово N из M» уже показан для текущего состава очереди
 let cvJobs = {};
 
 // ── мост к Python: единая точка, чтобы отклонённое обещание не оставляло
@@ -260,13 +266,69 @@ function onDropped(e) {
 }
 
 // ── очередь расшифровки ──────────────────────────────────────────────────
+// Повторное добавление файла, который уже в очереди со статусом done/error,
+// не плодит вторую карточку, а сбрасывает существующую в ожидание (В4).
+function resetJob(j) {
+  j.status = 'queued'; j.msg = queuePaused ? 'Ожидает' : 'В очереди';
+  j.segments = []; j.turns = null; j.names = {}; j.notes = [];
+  j.progress = null; j.pct = ''; j.backend = null; j.modelKey = null;
+  if (current && current.id === j.id) showJob(j);
+}
 function addToQueue(paths) {
+  summaryShown = false;
   for (const p of paths) {
-    if (jobs.some(j => j.path === p && j.status !== 'done' && j.status !== 'error')) continue;
+    const existing = jobs.find(j => j.path === p);
+    if (existing) {
+      if (existing.status === 'done' || existing.status === 'error') resetJob(existing);
+      continue; // уже в очереди или считается — вторую карточку не создаём
+    }
     jobs.push({ id: 'j' + Date.now() + Math.random().toString(36).slice(2, 6), path: p,
-      name: p.split(/[\\/]/).pop(), status: 'queued', segments: [], msg: 'В очереди' });
+      name: p.split(/[\\/]/).pop(), status: 'queued', segments: [],
+      msg: queuePaused ? 'Ожидает' : 'В очереди' });
   }
-  renderQueue(); pump();
+  renderQueue();
+  if (!queuePaused) pump();
+}
+function retryJob(j) {
+  summaryShown = false;
+  resetJob(j);
+  renderQueue();
+  if (!queuePaused) pump();
+}
+function removeJob(j) {
+  jobs = jobs.filter(x => x.id !== j.id);
+  if (current && current.id === j.id) {
+    current = null;
+    $('#transcript').innerHTML = '<div class="empty">Текст появится здесь по мере распознавания</div>';
+    document.querySelectorAll('.save').forEach(b => b.disabled = true);
+    $('#btnCopy').disabled = true; $('#btnFolder').disabled = true;
+    $('#stMsg').textContent = 'Готов к работе'; $('#stPct').textContent = '';
+    setBar(0, false);
+  }
+  renderQueue();
+}
+// «Остановить»: текущий файл прерывается, но остальные queued сами не
+// стартуют — человек, нажавший «Остановить», не ждёт мгновенного продолжения.
+function stopQueue() {
+  queuePaused = true;
+  jobs.filter(j => j.status === 'queued').forEach(j => j.msg = 'Ожидает');
+  renderQueue();
+  api('cancel');
+}
+function resumeQueue() {
+  queuePaused = false;
+  jobs.filter(j => j.status === 'queued').forEach(j => j.msg = 'В очереди');
+  renderQueue();
+  pump();
+}
+function modelInfoText(j) {
+  if (!j.modelKey) return '';
+  const b = { cpu: 'процессор', cuda: 'видеокарта NVIDIA', mlx: 'видеокарта (Apple)' }[j.backend];
+  return b ? `${j.modelKey} · ${b}` : j.modelKey;
+}
+function updateQueueControls() {
+  $('#btnCancel').disabled = !running;
+  $('#btnResumeQueue').style.display = queuePaused ? '' : 'none';
 }
 function renderQueue() {
   const q = $('#queue'); q.innerHTML = '';
@@ -274,26 +336,54 @@ function renderQueue() {
     const d = document.createElement('div');
     d.className = 'item' + (current && current.id === j.id ? ' active' : '');
     const cls = { done: 'ok', error: 'err', running: 'run' }[j.status] || '';
+    const mi = modelInfoText(j);
     d.innerHTML = `<div class="name" title="${j.path}">${j.name}</div><div class="st ${cls}">${j.msg}</div>` +
-      (j.notes || []).map(n => `<div class="st" style="color:var(--warn)">⚠ ${n}</div>`).join('');
+      (mi ? `<div class="st" style="color:var(--muted)">${mi}</div>` : '') +
+      (j.notes || []).map(n => `<div class="st" style="color:var(--warn)">⚠ ${n}</div>`).join('') +
+      `<div class="actions"></div>`;
     d.onclick = () => { showJob(j); };
+    const actions = d.querySelector('.actions');
+    const addBtn = (label, cls2, fn) => {
+      const b = document.createElement('button'); b.textContent = label; if (cls2) b.className = cls2;
+      b.onclick = e => { e.stopPropagation(); fn(); };
+      actions.append(b);
+    };
+    if (j.status === 'running') addBtn('Остановить', 'danger', stopQueue);
+    else if (j.status === 'done' || j.status === 'error') {
+      addBtn('Повторить', '', () => retryJob(j));
+      addBtn('×', '', () => removeJob(j));
+    }
     q.append(d);
   }
+  updateQueueControls();
+}
+// Когда очередь опустела (никто не queued/running) — итог: сколько готово,
+// сколько с ошибкой. Флаг сбрасывается при добавлении/повторе, чтобы не
+// показывать один и тот же тост повторно, пока человек просто смотрит на список.
+function checkBatchSummary() {
+  if (!jobs.length || summaryShown) return;
+  if (jobs.some(j => j.status === 'queued' || j.status === 'running')) return;
+  summaryShown = true;
+  const doneCount = jobs.filter(j => j.status === 'done').length;
+  const errCount = jobs.filter(j => j.status === 'error').length;
+  toast(`Готово ${doneCount} из ${doneCount + errCount}, ошибок ${errCount}`);
 }
 async function pump() {
-  if (running) return;
+  if (running || queuePaused) { updateQueueControls(); return; }
   const next = jobs.find(j => j.status === 'queued');
-  if (!next) return;
+  if (!next) { checkBatchSummary(); updateQueueControls(); return; }
   running = true;
   next.status = 'running'; next.msg = 'Запуск…'; next.startedAt = Date.now();
+  const mi = INFO.models.find(x => x.key === SET.model) || INFO.models[0];
+  next.modelKey = mi.resolved;
   showJob(next);
-  $('#btnCancel').disabled = false;
+  updateQueueControls();
   let r;
   try { r = await api('start', next.id, next.path, SET.model, SET.language, SET.prefer_gpu, !!SET.diarize, SET.num_speakers || 0); }
   catch (err) { r = { ok: false, error: errMsg(err) }; }
   if (!r.ok) {
     next.status = 'error'; next.msg = r.error;
-    running = false; $('#btnCancel').disabled = true;
+    running = false;
     renderQueue(); pump();
   }
 }
@@ -304,7 +394,7 @@ setInterval(() => {
   for (const j of jobs) {
     if (j.status === 'running' && j.msg === 'Запуск…' && j.startedAt && Date.now() - j.startedAt > 120000) {
       j.status = 'error'; j.msg = 'Движок не ответил';
-      running = false; $('#btnCancel').disabled = true;
+      running = false;
       renderQueue(); pump();
     }
   }
@@ -420,17 +510,29 @@ function renameSpeaker(j, id) {
 }
 function withNames(j) { return j.segments.map(s => ({ ...s, speaker: s.speaker ? spkName(j, s.speaker) : undefined })); }
 async function finishJob(j, ok = true) {
-  running = false; $('#btnCancel').disabled = true;
+  running = false;
   const c = $('#cur'); if (c) c.remove();
   if (ok && SET.autosave && j.segments.length) {
-    try { const w = await api('autosave', j.path, withNames(j), SET.autosave_formats || ['txt', 'srt']);
-      toast('Сохранено: ' + w.map(x => x.split(/[\\/]/).pop()).join(', ')); } catch (err) { toast('Не удалось сохранить: ' + errMsg(err)); }
+    try {
+      const w = await api('autosave', j.path, withNames(j), SET.autosave_formats || ['txt', 'srt']);
+      const names = w.written.map(x => x.split(/[\\/]/).pop()).join(', ');
+      if (w.fallback) {
+        // тихое ухудшение (папка с файлом недоступна) — обязано быть заметно, не только в логе
+        j.savedDir = w.fallback.dir;
+        toast(`Папка с файлом недоступна для записи — сохранил в ${w.fallback.label}: ${names}`);
+      } else {
+        j.savedDir = null;
+        toast('Сохранено: ' + names);
+      }
+    } catch (err) { toast('Не удалось сохранить: ' + errMsg(err)); }
   }
+  renderQueue();
   pump();
 }
 
 // ── кнопки ───────────────────────────────────────────────────────────────
-$('#btnCancel').onclick = () => api('cancel');
+$('#btnCancel').onclick = stopQueue;
+$('#btnResumeQueue').onclick = resumeQueue;
 document.querySelectorAll('.save').forEach(b => b.onclick = async () => {
   if (!current) return;
   const out = await api('save_as', withNames(current), b.dataset.fmt, current.name.replace(/\.[^.]+$/, ''));
@@ -442,7 +544,9 @@ $('#btnCopy').onclick = async () => {
   try { await navigator.clipboard.writeText(txt); toast('Текст скопирован'); }
   catch { const ta = document.createElement('textarea'); ta.value = txt; document.body.append(ta); ta.select(); document.execCommand('copy'); ta.remove(); toast('Текст скопирован'); }
 };
-$('#btnFolder').onclick = () => current && api('open_folder', current.path);
+// Автосохранение могло уйти в фолбэк-каталог (папка с файлом недоступна) —
+// «Открыть папку» должна вести туда, где результат реально лежит, не к исходнику.
+$('#btnFolder').onclick = () => current && api('open_folder', current.savedDir || current.path);
 $('#chkTime').onchange = e => document.body.classList.toggle('notime', !e.target.checked);
 
 // ── настройки ────────────────────────────────────────────────────────────
@@ -474,6 +578,7 @@ function tsPreview() {
   $('#sTsPreview').textContent = mode === 'none' ? 'Пример: Привет, это проверка…' : `Пример: ${mk(185)} Привет, это проверка…`;
 }
 ['#sTsMode', '#sTsStyle'].forEach(sel => $(sel).onchange = tsPreview);
+$('#btnOpenLogSettings').onclick = () => api('open_log').catch(() => {});
 $('#sClose').onclick = () => $('#modal').classList.remove('show');
 $('#sSave').onclick = async () => {
   SET = await api('set_settings', { model: $('#sModel').value, language: $('#sLang').value,

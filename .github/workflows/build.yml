@@ -193,9 +193,9 @@ jobs:
           foreach ($name in @("Transkrib.exe", "Transkrib-console.exe")) {
             $vi = (Get-Item "dist\Transkrib\$name").VersionInfo
             Write-Host "$name ProductVersion=$($vi.ProductVersion) FileVersion=$($vi.FileVersion)"
-            if ([string]::IsNullOrWhiteSpace($vi.ProductVersion)) { throw "$name: ProductVersion пуст" }
+            if ([string]::IsNullOrWhiteSpace($vi.ProductVersion)) { throw "${name}: ProductVersion пуст" }
             if ($vi.ProductVersion -ne $env:TRANSKRIB_VERSION) {
-              throw "$name: ProductVersion '$($vi.ProductVersion)' != ожидаемого '$($env:TRANSKRIB_VERSION)'"
+              throw "${name}: ProductVersion '$($vi.ProductVersion)' != ожидаемого '$($env:TRANSKRIB_VERSION)'"
             }
           }
 

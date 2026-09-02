@@ -1,5 +1,6 @@
 """Окно приложения: pywebview + мост Python↔JS. Никаких портов и серверов —
 JS зовёт методы Api напрямую, Python толкает события через evaluate_js."""
+import errno
 import functools
 import json
 import os
@@ -53,6 +54,103 @@ def load_settings():
 def save_settings(s):
     with open(_settings_path(), "w", encoding="utf-8") as f:
         json.dump(s, f, ensure_ascii=False, indent=2)
+
+
+# ── автосохранение без перезаписи и с фолбэком (В1) ─────────────────────────
+def _documents_dir():
+    """~/Documents/Transkrib (на Windows — %USERPROFILE%\\Documents\\Transkrib):
+    первый каталог-фолбэк, когда папка с исходником недоступна для записи."""
+    if sys.platform == "win32":
+        base = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    else:
+        base = os.path.expanduser("~")
+    return os.path.join(base, "Documents", "Transkrib")
+
+
+# Коды ошибок, при которых имеет смысл переключиться на другой каталог, а не
+# считать это фатальной ошибкой. ENOSPC сюда нарочно не входит — «нет места»
+# не лечится сменой папки, это отдельная понятная ошибка для пользователя.
+_WRITE_FALLBACK_ERRNOS = {errno.EACCES, errno.EROFS, errno.EPERM, errno.ENOENT}
+
+
+def _is_write_permission_error(e):
+    """os.access() тут не годится: он врёт на сетевых дисках и в OneDrive (см. ТЗ).
+    Надёжнее пробовать писать и ловить настоящую ошибку доступа."""
+    if isinstance(e, PermissionError):
+        return True
+    return isinstance(e, OSError) and e.errno in _WRITE_FALLBACK_ERRNOS
+
+
+def _autosave_index_path():
+    return os.path.join(engine.data_dir(), "autosave_index.json")
+
+
+def _load_autosave_index():
+    try:
+        with open(_autosave_index_path(), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_autosave_index(idx):
+    try:
+        with open(_autosave_index_path(), "w", encoding="utf-8") as f:
+            json.dump(idx, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass  # реестр — вспомогательная штука для распознавания «наших» файлов; потерять не страшно
+
+
+def _is_ours(idx, path):
+    """Файл в реестре и его размер/время изменения совпадают с тем, что мы сами
+    записали — значит после нас его никто не трогал и перезаписать можно. Иначе
+    (чужой файл или наш, но изменённый человеком) — только под новым именем."""
+    rec = idx.get(path)
+    if not rec:
+        return False
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    return rec.get("size") == st.st_size and rec.get("mtime") == st.st_mtime
+
+
+def _autosave_target(dest_dir, base, fmt, idx):
+    """<base>.<fmt>, если файла нет или это наш; иначе <base>.transkrib.<fmt>,
+    при новой коллизии <base>.transkrib-2.<fmt> и так далее — плееры подхватывают
+    video.transkrib.srt так же, как video.srt."""
+    direct = os.path.join(dest_dir, f"{base}.{fmt}")
+    if not os.path.exists(direct) or _is_ours(idx, direct):
+        return direct
+    out = os.path.join(dest_dir, f"{base}.transkrib.{fmt}")
+    n = 2
+    while os.path.exists(out) and not _is_ours(idx, out):
+        out = os.path.join(dest_dir, f"{base}.transkrib-{n}.{fmt}")
+        n += 1
+    return out
+
+
+def _write_atomic(out, content):
+    """Во временный файл рядом, затем переименование — не оставить получателя
+    (например, плеер, следящий за файлом) с половиной записи."""
+    tmp = out + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.replace(tmp, out)
+
+
+def _autosave_to_dir(dest_dir, base, formats, render, idx):
+    """Пишет все форматы в dest_dir и регистрирует их в реестре. Бросает исключение
+    на первой же неудачной записи — вызывающий код решает, пробовать ли другой каталог."""
+    os.makedirs(dest_dir, exist_ok=True)
+    written = []
+    for fmt in formats:
+        out = _autosave_target(dest_dir, base, fmt, idx)
+        _write_atomic(out, render(fmt))
+        st = os.stat(out)
+        idx[out] = dict(size=st.st_size, mtime=st.st_mtime)
+        written.append(out)
+    return written
 
 
 class Api:
@@ -194,15 +292,47 @@ class Api:
         return export.render(segments, fmt, title, self._opts())
 
     def autosave(self, path, segments, formats):
-        """Положить результат рядом с исходником. Возвращает список записанных файлов."""
-        base = os.path.splitext(path)[0]
-        written = []
-        for fmt in formats:
-            out = f"{base}.{fmt}"
-            with open(out, "w", encoding="utf-8") as f:
-                f.write(export.render(segments, fmt, os.path.basename(path), self._opts()))
-            written.append(out)
-        return written
+        """Положить результат рядом с исходником, не затирая чужие файлы (В1).
+        Если папка недоступна для записи — переключаемся на Документы/Transkrib,
+        а если и туда нельзя — на рабочую папку программы. Возвращает
+        dict(written=[...], fallback=None | {dir, reason, label})."""
+        base = os.path.splitext(os.path.basename(path))[0]
+        idx = _load_autosave_index()
+        opts = self._opts()
+
+        def render(fmt):
+            return export.render(segments, fmt, os.path.basename(path), opts)
+
+        is_win = sys.platform == "win32"
+        attempts = [
+            (os.path.dirname(path) or ".", None, None),
+            (_documents_dir(), "нет доступа к папке с файлом",
+             r"Документы\Transkrib" if is_win else "Документы/Transkrib"),
+            (os.path.join(engine.data_dir(), "output"), "нет доступа и к папке Документы",
+             "рабочую папку программы"),
+        ]
+        last_err = None
+        for dest_dir, reason, label in attempts:
+            try:
+                written = _autosave_to_dir(dest_dir, base, formats, render, idx)
+            except OSError as e:
+                if e.errno == errno.ENOSPC:
+                    raise engine.UserError(
+                        f"На диске нет места для сохранения результата (папка {dest_dir})") from e
+                if not _is_write_permission_error(e):
+                    raise
+                last_err = e
+                engine.log(f"autosave: {dest_dir} недоступна для записи ({e}), пробую другой каталог")
+                continue
+            _save_autosave_index(idx)
+            fallback = None
+            if reason:
+                fallback = dict(dir=dest_dir, reason=reason, label=label)
+                engine.log(f"autosave: сохранил в {dest_dir} вместо папки с файлом ({reason})")
+            return dict(written=written, fallback=fallback)
+        raise engine.UserError(
+            "Не удалось сохранить результат: ни папка с файлом, ни Документы, ни рабочая папка "
+            f"программы недоступны для записи ({last_err})")
 
     def save_as(self, segments, fmt, suggested):
         import webview
