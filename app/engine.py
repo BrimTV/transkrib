@@ -181,7 +181,7 @@ _FW_PATTERNS = ["config.json", "preprocessor_config.json", "model.bin", "tokeniz
 def model_is_cached(model_key, backend):
     if bundled_model_path(model_key, backend):
         return True
-    from huggingface_hub import try_to_load_from_cache
+    from huggingface_hub import try_to_load_from_cache  # noqa: E402
     repo = _repo_for(model_key, backend)
     probe = "config.json"
     r = try_to_load_from_cache(repo, probe, cache_dir=models_dir())

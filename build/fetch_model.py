@@ -19,9 +19,13 @@ if key not in engine.MODELS:
     sys.exit(f"неизвестная модель {key}; есть: {list(engine.MODELS)}")
 
 root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bundled_models")
-targets = [("fw", engine.MODELS[key]["fw"], engine._FW_PATTERNS)]
+# На Apple Silicon вшиваем только MLX-версию: она работает на любом таком маке,
+# а CPU-фолбэк (faster-whisper) в редком случае докачает свою копию сам.
+# Иначе пакет вдвое тяжелее (две копии одной модели).
 if sys.platform == "darwin" and platform.machine() == "arm64":
-    targets.append(("mlx", engine.MODELS[key]["mlx"], None))
+    targets = [("mlx", engine.MODELS[key]["mlx"], None)]
+else:
+    targets = [("fw", engine.MODELS[key]["fw"], engine._FW_PATTERNS)]
 
 for kind, repo, patterns in targets:
     dst = os.path.join(root, key, kind)
