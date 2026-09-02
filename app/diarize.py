@@ -6,10 +6,14 @@
 от длительности на 4 потоках. Синтетические TTS-голоса не различает — это
 свойство моделей, обученных на живой речи.
 """
+import json
 import os
+import subprocess
+import sys
 import tarfile
 import time
 import threading
+import traceback
 import urllib.request
 import wave
 
@@ -92,10 +96,14 @@ def _read_wav(path):
         return np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
 
 
-def run(wav_path, emit, num_speakers=0, cancel=None):
-    """→ список реплик [{start, end, speaker}], говорящие пронумерованы с 1 в порядке появления."""
+def _diarize_raw(wav_path, emit, num_speakers=0, cancel=None):
+    """Сырые реплики sherpa-onnx, без склейки обрывков (см. _finalize) — общий код
+    для run() (расчёт в этом же процессе) и worker_main() (расчёт в дочернем
+    процессе, см. run_in_worker). ascii_safe_path — здесь, а не в run(), чтобы
+    воркер тоже получал безопасные пути к моделям на Windows без UTF-8 (A1)."""
     import sherpa_onnx as so
     seg, emb = ensure_models(emit)
+    seg, emb = engine.ascii_safe_path(seg), engine.ascii_safe_path(emb)
     threads = max(1, min(4, (os.cpu_count() or 2) // 2))
     cfg = so.OfflineSpeakerDiarizationConfig(
         segmentation=so.OfflineSpeakerSegmentationModelConfig(
@@ -111,6 +119,10 @@ def run(wav_path, emit, num_speakers=0, cancel=None):
     t0 = time.time()
 
     def progress(done, total):
+        # Возврат не проверяется сегментацией и кластеризацией (они колбэка не
+        # имеют вовсе, см. заголовок файла) — это только для фазы эмбеддингов,
+        # надёжной отмены не даёт. Настоящая отмена — run_in_worker, убийством
+        # процесса.
         if cancel is not None and cancel.is_set():
             return -1
         if total:
@@ -120,9 +132,150 @@ def run(wav_path, emit, num_speakers=0, cancel=None):
         return 0
 
     result = sd.process(samples, callback=progress)
-    raw = [dict(start=float(s.start), end=float(s.end), speaker=int(s.speaker))
-           for s in result.sort_by_start_time()]
+    return [dict(start=float(s.start), end=float(s.end), speaker=int(s.speaker))
+            for s in result.sort_by_start_time()]
+
+
+def run(wav_path, emit, num_speakers=0, cancel=None):
+    """→ список реплик [{start, end, speaker}], говорящие пронумерованы с 1 в порядке
+    появления. Считает в этом же процессе — годится для selftest без реальной отмены.
+    Из engine.transcribe_file зовите run_in_worker: колбэк sherpa-onnx не прерывает
+    сегментацию и кластеризацию, поэтому надёжная отмена — только убийством процесса."""
+    raw = _diarize_raw(wav_path, emit, num_speakers, cancel)
     return _finalize(raw, forced=num_speakers > 0)
+
+
+# ── воркер: убиваемый процесс вместо колбэка, который не прерывает расчёт ─────
+def worker_main(argv):
+    """Тело режима --diarize-worker (см. app/main.py::main). argv — всё после
+    самого флага: `<wav> <out.json> --speakers N --parent-pid P`.
+
+    Не пишет в transkrib.log (два процесса и ротация лога на Windows дают
+    PermissionError) и не импортирует webview/mlx — воркеру они не нужны.
+    Кодировка stdout уже переключена на UTF-8 в app.main.main() до диспетчеризации
+    режимов — здесь второй раз не делаем."""
+    wav_path, out_path = argv[0], argv[1]
+    opt = lambda k, d: argv[argv.index(k) + 1] if k in argv else d  # noqa: E731
+    num_speakers = int(opt("--speakers", "0"))
+    parent_pid = int(opt("--parent-pid", "0"))
+
+    def watch_parent():
+        # Родитель мог быть убит диспетчером задач или упасть без предупреждения —
+        # раз в 2 с проверяем, жив ли он, и выходим сами, чтобы не остаться
+        # сиротой, молотящей CPU все сегментацию и кластеризацию.
+        import psutil
+        while True:
+            time.sleep(2.0)
+            if not psutil.pid_exists(parent_pid):
+                os._exit(1)
+    threading.Thread(target=watch_parent, daemon=True).start()
+
+    def emit(e):
+        print(json.dumps(e, ensure_ascii=False), flush=True)
+
+    try:
+        raw = _diarize_raw(wav_path, emit, num_speakers, cancel=None)
+        tmp = out_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(raw, f)
+        os.replace(tmp, out_path)
+        return 0
+    except Exception:
+        traceback.print_exc(file=sys.stderr)
+        return 1
+
+
+def run_in_worker(wav_path, emit, num_speakers=0, cancel=None):
+    """Как run(), но расчёт идёт в отдельном процессе: колбэк прогресса sherpa-onnx
+    вызывается только в фазе эмбеддингов и его возврат не проверяется, а фазы
+    сегментации и кластеризации колбэка не имеют вовсе — патч колбэка отмену не
+    даёт в принципе. subprocess с перезапуском своего же бинарника, а не
+    multiprocessing: очередь multiprocessing тянет за собой SemLock и лишний
+    процесс resource_tracker, а proc.kill() убивает мгновенно и надёжно."""
+    cancel = cancel or threading.Event()
+    ensure_models(emit)  # качаем в родителе — воркер не должен трогать сеть
+    out_path = wav_path + ".diarize.json"
+    try:
+        os.remove(out_path)
+    except OSError:
+        pass
+
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable, "--diarize-worker", wav_path, out_path,
+               "--speakers", str(int(num_speakers)), "--parent-pid", str(os.getpid())]
+        cwd = None
+    else:
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        cmd = [sys.executable, "-m", "app.main", "--diarize-worker", wav_path, out_path,
+               "--speakers", str(int(num_speakers)), "--parent-pid", str(os.getpid())]
+        cwd = repo_root
+
+    from . import media  # тот же флаг прячет консоль ffmpeg — media._NO_WINDOW
+    proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", errors="replace", bufsize=1,
+                            **media._NO_WINDOW)
+
+    if sys.platform == "win32":
+        try:
+            import psutil
+            psutil.Process(proc.pid).nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+        except Exception:
+            pass  # не критично: приоритет — только чтобы окно приложения не подтормаживало
+
+    stderr_tail = []
+
+    def read_stderr():
+        for line in proc.stderr:
+            stderr_tail.append(line)
+            if len(stderr_tail) > 40:
+                stderr_tail.pop(0)
+    threading.Thread(target=read_stderr, daemon=True).start()
+
+    def read_stdout():
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                emit(json.loads(line))
+            except ValueError:
+                pass
+    t_out = threading.Thread(target=read_stdout, daemon=True)
+    t_out.start()
+
+    try:
+        # Ключевой момент: чтение stdout выше блокирующее (readline), а в фазах
+        # сегментации и кластеризации воркер молчит десятками секунд — проверить
+        # cancel внутри read_stdout негде. Поэтому отдельный цикл-наблюдатель.
+        killed = False
+        while proc.poll() is None:
+            if cancel.wait(0.2):
+                killed = True
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                break
+
+        # На Windows временный wav нельзя удалить, пока ОС не закроет хэндлы
+        # убитого процесса — transcribe_file чистит его в finally сразу после
+        # возврата отсюда, поэтому дожидаемся здесь, а не полагаемся на poll().
+        proc.wait(timeout=10)
+        t_out.join(timeout=2.0)
+
+        if killed:
+            raise InterruptedError("отменено")
+        if proc.returncode != 0:
+            raise RuntimeError("воркер диаризации упал: " + "".join(stderr_tail[-40:]).strip())
+
+        with open(out_path, encoding="utf-8") as f:
+            raw = json.load(f)
+        return _finalize(raw, forced=num_speakers > 0)
+    finally:
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
 
 
 def _finalize(raw, forced=False):

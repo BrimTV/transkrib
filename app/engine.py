@@ -115,6 +115,63 @@ def models_dir():
     return d
 
 
+# ── безопасные пути для C++-библиотек на Windows (A1) ──────────────────────────
+def _short_path_name(p):
+    """GetShortPathNameW отдельной функцией: тестам проще подменить её саму, чем
+    возиться с ctypes.windll на машине без Windows."""
+    import ctypes
+    buf = ctypes.create_unicode_buffer(260)
+    n = ctypes.windll.kernel32.GetShortPathNameW(p, buf, 260)
+    return buf.value if n else p
+
+
+def _junction_or_copy(p):
+    """Junction в C:\\Users\\Public\\Transkrib\\m-<sha1(p)[:8]> — stdlib, без прав
+    администратора, ноль байт, работает между томами → копия, если и junction не
+    удался (например, файловая система без их поддержки)."""
+    import hashlib
+    digest = hashlib.sha1(p.encode("utf-8")).hexdigest()[:8]
+    link = os.path.join(r"C:\Users\Public\Transkrib", f"m-{digest}")
+    if os.path.exists(link):
+        return link
+    try:
+        os.makedirs(os.path.dirname(link), exist_ok=True)
+        import _winapi
+        _winapi.CreateJunction(p, link)
+        return link
+    except Exception:
+        pass
+    try:
+        if os.path.isdir(p):
+            shutil.copytree(p, link)
+            return link
+        os.makedirs(link, exist_ok=True)
+        shutil.copy2(p, os.path.join(link, os.path.basename(p)))
+        return os.path.join(link, os.path.basename(p))
+    except Exception:
+        return p  # ничего не вышло — отдаём как есть, дальше упадёт с понятной ошибкой открытия файла
+
+
+def ascii_safe_path(p, acp=None):
+    """ctranslate2 и sherpa-onnx открывают файлы через std::ifstream по узкой
+    строке; на Windows это ANSI-кодовая страница процесса, и путь с кириллицей
+    (типичная папка обычного пользователя) не откроется, если она не UTF-8.
+    Три попытки по возрастанию инвазивности: короткое имя 8.3, junction, копия.
+    acp — кодовая страница параметром ради теста без реальной Windows: обычно
+    None, тогда берём настоящую GetACP()."""
+    if sys.platform != "win32":
+        return p
+    if acp is None:
+        import ctypes
+        acp = ctypes.windll.kernel32.GetACP()
+    if acp == 65001 or p.isascii():
+        return p
+    short = _short_path_name(p)
+    if short.isascii():
+        return short
+    return _junction_or_copy(p)
+
+
 # ── железо ───────────────────────────────────────────────────────────────────
 _cuda_prepared = False
 
@@ -308,6 +365,7 @@ def load_model(model_key, backend, emit, cancel=None):
         if key in _loaded:
             return _loaded[key]
     path = ensure_model(model_key, backend, emit, cancel)
+    path = ascii_safe_path(path)  # кириллица в пути на Windows без UTF-8 — см. ascii_safe_path
     emit(dict(type="stage", stage="load", msg=f"Загружаю модель {model_key} в память"))
     t0 = time.time()
     if backend == "mlx":
@@ -404,7 +462,12 @@ def _transcribe_fw(model, wav, language, backend, emit, cancel, total_sec):
             raise InterruptedError("отменено")
         text = s.text.strip()
         if text:
-            emit(dict(type="segment", start=s.start, end=s.end, text=text))
+            # Показатели качества сегмента отдают оба движка; фильтр галлюцинаций
+            # без них слепнет на самых надёжных признаках (тишина и зацикливание).
+            emit(dict(type="segment", start=s.start, end=s.end, text=text,
+                      no_speech_prob=getattr(s, "no_speech_prob", None),
+                      avg_logprob=getattr(s, "avg_logprob", None),
+                      compression_ratio=getattr(s, "compression_ratio", None)))
         emit(dict(type="progress", done_sec=s.end, total_sec=total_sec))
 
 
@@ -450,7 +513,10 @@ def _transcribe_mlx(model_path, wav, language, emit, cancel, total_sec):
             for s in res.get("segments", []):
                 text = (s.get("text") or "").strip()
                 if text:
-                    emit(dict(type="segment", start=a + s["start"], end=a + s["end"], text=text))
+                    emit(dict(type="segment", start=a + s["start"], end=a + s["end"], text=text,
+                              no_speech_prob=s.get("no_speech_prob"),
+                              avg_logprob=s.get("avg_logprob"),
+                              compression_ratio=s.get("compression_ratio")))
             emit(dict(type="progress", done_sec=b, total_sec=total_sec))
     finally:
         try:
@@ -471,7 +537,21 @@ def transcribe_file(src, model_key, language, emit, cancel=None, prefer_gpu=True
 
     _emit = emit
 
+    # Единственная точка, через которую проходят сегменты обоих движков, — здесь и
+    # стоит фильтр галлюцинаций (см. app/cleanup.py): на музыке и тишине Whisper
+    # выдаёт повторы и фразы из обучающих субтитров, и это доходило до человека.
+    from .cleanup import SegmentFilter
+    seg_filter = SegmentFilter(language)
+
     def emit(e):
+        if e["type"] == "segment":
+            why = seg_filter.verdict(e)
+            if why:
+                log(f"фильтр {why}: [{e['start']:.1f}-{e['end']:.1f}] {e['text'][:80]}")
+                return
+        if e["type"] == "done" and seg_filter.dropped:
+            e["dropped"] = seg_filter.dropped
+            e["msg"] = f"{e['msg']} (убрано повторов: {seg_filter.dropped})"
         if e["type"] in ("stage", "done", "error", "cancelled", "speakers"):
             log(e.get("msg") or f"{e['type']} count={e.get('count')}")
         _emit(e)
@@ -524,7 +604,7 @@ def transcribe_file(src, model_key, language, emit, cancel=None, prefer_gpu=True
                 log(f"unload before diarization: {avail:.1f} GB free")
             emit(dict(type="stage", stage="diarize", msg="Текст готов, определяю говорящих"))
             try:
-                turns = _diar.run(wav, emit, num_speakers, cancel)
+                turns = _diar.run_in_worker(wav, emit, num_speakers, cancel)
                 n = len({t["speaker"] for t in turns})
                 emit(dict(type="speakers", turns=turns, count=n))
             except InterruptedError:
@@ -609,8 +689,11 @@ def selftest(model_key=None):
         if diarize.available() and diarize.model_paths():
             wav16 = os.path.join(tmp, "tone16.wav")
             media.extract_wav(src, wav16)
-            turns = diarize.run(wav16, lambda e: None)
-            print(f"diarization: ok, реплик на синтетическом тоне: {len(turns)}")
+            # run_in_worker, а не run(): проверяет, что перезапуск собственного
+            # бинарника с флагом --diarize-worker реально работает (A3) — то же,
+            # что использует transcribe_file в обычной работе.
+            turns = diarize.run_in_worker(wav16, lambda e: None)
+            print(f"diarization: ok (через воркер), реплик на синтетическом тоне: {len(turns)}")
         else:
             print("diarization: модели не вшиты, пропускаю")
     except Exception as e:

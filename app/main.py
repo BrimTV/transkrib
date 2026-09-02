@@ -12,6 +12,21 @@ import traceback
 from . import __version__, engine, export, media
 
 
+def _ensure_utf8_console():
+    """Консоль Windows часто не UTF-8 (cp1252 и т.п.): печать кириллицы валит
+    процесс UnicodeEncodeError на первой же русской строке — так падал
+    --check-env в CI на строке `webview2=неизвестно...`. Одно место для всех
+    неоконных режимов, зовём в самом начале main() до любой печати.
+    sys.stdout/stderr в windowed-сборке бывают None или уже подменены (см.
+    run.py) — у таких объектов reconfigure может не быть."""
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
 def _ui_path():
     base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, "app", "ui", "index.html")
@@ -241,19 +256,17 @@ class Api:
 
 
 def _webview2_version():
-    """Версия WebView2 Runtime или None, если не найден. Пока заглушка: настоящую
-    проверку через winreg (app/winprep.py) добавит задача A2. Крючок для CI
-    (TRANSKRIB_FAKE_NO_WEBVIEW2) оставлен уже сейчас, чтобы --check-env можно было
-    проверить в CI до того, как A2 приземлится."""
-    if os.environ.get("TRANSKRIB_FAKE_NO_WEBVIEW2") == "1":
-        return None
-    return "неизвестно (проверка появится в A2)"
+    """Версия WebView2 Runtime или None. Настоящая проверка реестра — в app/winprep.py;
+    крючок TRANSKRIB_FAKE_NO_WEBVIEW2 нужен CI, чтобы проверить отрицательную ветку
+    на раннере, где WebView2 как раз установлен."""
+    from . import winprep
+    return winprep.webview2_version()
 
 
 def _dotnet_release():
-    """Release-номер .NET Framework. Заглушка, см. _webview2_version — только факт
-    в отчёте, на код выхода --check-env пока не влияет."""
-    return "неизвестно (проверка появится в A2)"
+    """Release-номер .NET Framework (4.7.2 = 461808) или None."""
+    from . import winprep
+    return winprep.dotnet_release()
 
 
 def _run_check_env():
@@ -399,6 +412,17 @@ def _run_smoke(argv):
 
 
 def main():
+    _ensure_utf8_console()
+
+    if "--diarize-worker" in sys.argv:
+        # Отдельный убиваемый процесс для диаризации (A3): sherpa-onnx не даёт
+        # прервать сегментацию и кластеризацию колбэком, поэтому единственная
+        # надёжная отмена — kill этого процесса из родителя (diarize.run_in_worker).
+        # Ветка до import webview — воркеру окно не нужно и не должно открываться.
+        from . import diarize
+        args = sys.argv[sys.argv.index("--diarize-worker") + 1:]
+        sys.exit(diarize.worker_main(args))
+
     if "--check-env" in sys.argv:
         sys.exit(_run_check_env())
 
@@ -430,11 +454,7 @@ def main():
         if not path:
             sys.exit("укажите файл")
         opt = lambda k, d: args[args.index(k) + 1] if k in args else d  # noqa: E731
-        for stream in (sys.stdout, sys.stderr):
-            try:
-                stream.reconfigure(encoding="utf-8", errors="replace")
-            except Exception:
-                pass
+        # Кодировка stdout/stderr уже переключена на UTF-8 в _ensure_utf8_console() выше.
         segs = []
 
         def show(e):
@@ -449,6 +469,12 @@ def main():
                                diarize="--speakers" in args)
         print(export.render(segs, "txt", opts=dict(ts_mode="paragraph")))
         sys.exit(0)
+
+    # До создания окна: без WebView2 pywebview молча откатится на движок Internet
+    # Explorer и человек увидит пустое окно без единого объяснения. Проверяем и
+    # говорим прямо, с предложением скачать. На macOS функция ничего не делает.
+    from . import winprep
+    winprep.require_ui_runtime()
 
     import webview
     api = Api()
