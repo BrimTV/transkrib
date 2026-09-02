@@ -229,6 +229,50 @@ jobs:
           }
           Write-Host "OK: кириллический путь, ACP=65001"
 
+      # Проводник помечает распакованные файлы как «из интернета», и .NET
+      # отказывается грузить такие сборки (ошибка 0x80131515) — окно просто не
+      # открывается. Проверяем, что самолечение в run.py снимает пометку.
+      - name: Пометка «из интернета» не мешает запуску (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force motw_check -ErrorAction SilentlyContinue
+          Expand-Archive -Path $env:ZIP_NAME -DestinationPath motw_check
+          Get-ChildItem -Path motw_check -Recurse -Include *.dll,*.pyd,*.exe | ForEach-Object {
+            Set-Content -Path $_.FullName -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3"
+          }
+          $marked = (Get-ChildItem -Path motw_check -Recurse -Include *.dll | Select-Object -First 1).FullName
+          Write-Host "помечено, пример: $marked"
+          & "motw_check\Transkrib\Transkrib-console.exe" --check-env
+          if ($LASTEXITCODE -ne 0) { throw "с пометкой из интернета не запустилось, код $LASTEXITCODE" }
+          $left = Get-Item -Path $marked -Stream Zone.Identifier -ErrorAction SilentlyContinue
+          if ($left) { throw "пометка Zone.Identifier осталась на $marked" }
+          Write-Host "OK: пометка снята, приложение запускается"
+
+      # Ни один запуск не должен ходить в сеть: модель вшита в пакет. Глухой прокси
+      # ловит любую попытку — у человека без интернета всё обязано работать.
+      - name: Работа без интернета (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          HTTPS_PROXY: http://127.0.0.1:9
+          HTTP_PROXY: http://127.0.0.1:9
+          NO_PROXY: ''
+        run: |
+          & "dist\Transkrib\Transkrib-console.exe" --selftest
+          if ($LASTEXITCODE -ne 0) { throw "без интернета самопроверка не прошла, код $LASTEXITCODE" }
+          Write-Host "OK: без интернета работает"
+
+      - name: Работа без интернета (macOS)
+        if: runner.os == 'macOS'
+        env:
+          HTTPS_PROXY: http://127.0.0.1:9
+          HTTP_PROXY: http://127.0.0.1:9
+          NO_PROXY: ''
+        run: |
+          ./dist/Transkrib.app/Contents/MacOS/Transkrib-console --selftest
+          echo "OK: без интернета работает"
+
       - uses: actions/upload-artifact@v4
         with:
           name: Transkrib-${{ matrix.variant }}-${{ matrix.name }}
