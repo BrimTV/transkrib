@@ -29,6 +29,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Версия в одном месте (app/__init__.py читает TRANSKRIB_VERSION), но само
+      # значение вычисляет CI: по тегу vX.Y.Z — версия из тега, иначе базовая
+      # версия из app/__init__.py плюс короткий хеш коммита (чтобы отличать
+      # автосборки с main друг от друга). shell: bash — работает одинаково на
+      # windows-latest (входит в состав раннера Git for Windows) и macos-14.
+      - name: Compute version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            BASE=$(python3 -c "import app; print(app.__version__)")
+            SHA=$(git rev-parse --short=7 HEAD)
+            VERSION="${BASE}+${SHA}"
+          fi
+          echo "TRANSKRIB_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "[version] $VERSION"
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -51,7 +69,7 @@ jobs:
         run: python -m pytest -q -m "not slow"
 
       - name: Fetch bundled model
-        run: python build/fetch_model.py ${{ matrix.variant == 'lite' && 'small' || 'medium' }}
+        run: python build/fetch_model.py ${{ matrix.variant == 'lite' && 'small' || 'medium' }} ${{ matrix.variant }}
 
       - name: Selftest (source, bundled model)
         run: python -m app.engine --selftest
@@ -91,24 +109,130 @@ jobs:
         if: runner.os == 'macOS'
         run: ./dist/Transkrib.app/Contents/MacOS/Transkrib-console --check-env
 
+      # Имя архива короткое (без -windows-x64): длинные пути после распаковки —
+      # отдельная головная боль Windows (см. блок A7). ЧИТАЙ.txt кладём в корень
+      # архива рядом с папкой Transkrib, не внутрь неё — так его видно сразу.
+      # -mcu=on обязателен: без него имя ЧИТАЙ.txt (кириллица) на нерусской
+      # Windows превращается в кракозябры.
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          7z a -tzip -mx=3 Transkrib-${{ matrix.variant }}-${{ matrix.name }}.zip .\dist\Transkrib | Out-Null
-          Get-Item Transkrib-*.zip | Select-Object Name, @{n="MB";e={[math]::Round($_.Length/1MB)}}
+          Copy-Item build\README-windows.txt dist\ЧИТАЙ.txt
+          $zip = "Transkrib-${{ matrix.variant }}.zip"
+          7z a -tzip -mx=3 -mcu=on $zip .\dist\Transkrib .\dist\ЧИТАЙ.txt | Out-Null
+          Get-Item $zip | Select-Object Name, @{n="MB";e={[math]::Round($_.Length/1MB)}}
+          echo "ZIP_NAME=$zip" >> $env:GITHUB_ENV
 
       - name: Package (macOS)
         if: runner.os == 'macOS'
         run: |
           codesign --force --deep -s - dist/Transkrib.app
-          ditto -c -k --keepParent dist/Transkrib.app Transkrib-${{ matrix.variant }}-${{ matrix.name }}.zip
+          zip="Transkrib-${{ matrix.variant }}-${{ matrix.name }}.zip"
+          ditto -c -k --keepParent dist/Transkrib.app "$zip"
           ls -la Transkrib-*.zip
+          echo "ZIP_NAME=$zip" >> "$GITHUB_ENV"
+
+      # ── Проверки собранного пакета (Windows) ──────────────────────────────
+      # Всё ниже нельзя перепроверить на маке разработчиков — это единственное
+      # место, где баги A1/A6 (кодовая страница, манифест, версия, DLL) вообще
+      # можно поймать до того, как их найдёт живой пользователь.
+
+      - name: Проверка состава архива (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force archive_check -ErrorAction SilentlyContinue
+          7z x $env:ZIP_NAME -oarchive_check -y | Out-Null
+          if (-not (Test-Path "archive_check\ЧИТАЙ.txt")) { throw "ЧИТАЙ.txt отсутствует в архиве" }
+          if (-not (Test-Path "archive_check\Transkrib\Transkrib.exe")) { throw "Transkrib\Transkrib.exe отсутствует в архиве" }
+          Write-Host "OK: ЧИТАЙ.txt и Transkrib\Transkrib.exe на месте"
+          Remove-Item -Recurse -Force archive_check
+
+      - name: Манифест содержит activeCodePage (Windows)
+        if: runner.os == 'Windows'
+        shell: python
+        run: |
+          from PyInstaller.utils.win32 import winmanifest
+          for exe in ("dist/Transkrib/Transkrib.exe", "dist/Transkrib/Transkrib-console.exe"):
+              data = winmanifest.read_manifest_from_executable(exe)
+              text = data.decode("utf-8")
+              assert "activeCodePage" in text, f"activeCodePage не найден в манифесте {exe}"
+              print(f"[ci] {exe}: activeCodePage на месте")
+
+      - name: VC++ runtime DLL на месте (Windows)
+        if: runner.os == 'Windows'
+        shell: python
+        run: |
+          import pathlib, sys
+          internal = pathlib.Path("dist/Transkrib/_internal")
+          need = ["msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"]
+          have = {p.name.lower() for p in internal.rglob("*.dll")}
+          missing = [n for n in need if n.lower() not in have]
+          if missing:
+              sys.exit(f"не найдены DLL VC++ рантайма в {internal}: {missing}")
+          print("[ci] VC++ runtime DLL на месте:", need)
+
+      - name: CUDA DLL на месте (medium, Windows)
+        if: runner.os == 'Windows' && matrix.variant == 'medium'
+        shell: python
+        run: |
+          import pathlib, sys
+          internal = pathlib.Path("dist/Transkrib/_internal")
+          need = ["cublas64_12.dll", "cublasLt64_12.dll", "cudnn64_9.dll"]
+          have = {p.name.lower() for p in internal.rglob("*.dll")}
+          missing = [n for n in need if n.lower() not in have]
+          if missing:
+              sys.exit(f"не найдены DLL CUDA в {internal}: {missing}")
+          print("[ci] CUDA DLL на месте:", need)
+
+      - name: Сведения о версии у exe (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          foreach ($name in @("Transkrib.exe", "Transkrib-console.exe")) {
+            $vi = (Get-Item "dist\Transkrib\$name").VersionInfo
+            Write-Host "$name ProductVersion=$($vi.ProductVersion) FileVersion=$($vi.FileVersion)"
+            if ([string]::IsNullOrWhiteSpace($vi.ProductVersion)) { throw "$name: ProductVersion пуст" }
+            if ($vi.ProductVersion -ne $env:TRANSKRIB_VERSION) {
+              throw "$name: ProductVersion '$($vi.ProductVersion)' != ожидаемого '$($env:TRANSKRIB_VERSION)'"
+            }
+          }
+
+      # Честное воспроизведение бага A1: раннер сам по себе не русский (ACP по
+      # умолчанию не 65001), поэтому без activeCodePage в манифесте этот шаг
+      # обязан падать на загрузке модели по кириллическому пути. LOCALAPPDATA
+      # и TEMP тоже кириллические — ровно так, как у обычного пользователя.
+      - name: Самопроверка по кириллическому пути (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $base = "D:\Тест кириллицы ~ путь"
+          New-Item -ItemType Directory -Force "$base\Лок","$base\Врем" | Out-Null
+          Expand-Archive $env:ZIP_NAME $base -Force
+          $env:LOCALAPPDATA = "$base\Лок"
+          $env:TEMP = "$base\Врем"
+          $env:TMP = "$base\Врем"
+
+          $p = Start-Process -FilePath "$base\Transkrib\Transkrib.exe" -ArgumentList "--selftest" -Wait -PassThru -WorkingDirectory $base
+          $log = "$base\Лок\Transkrib\selftest.log"
+          Get-Content $log
+          if ($p.ExitCode -ne 0) { throw "selftest exit code $($p.ExitCode)" }
+          if (-not (Select-String -Path $log -Pattern "SELFTEST OK" -Quiet)) { throw "SELFTEST OK не найден в $log" }
+          if (-not (Test-Path "$base\Лок\Transkrib")) { throw "лог не появился в $base\Лок\Transkrib" }
+
+          # ACP=65001 — маркер, что наш манифест реально применился к процессу.
+          & "$base\Transkrib\Transkrib-console.exe" --check-env
+          $envLog = "$base\Лок\Transkrib\transkrib.log"
+          if (-not (Select-String -Path $envLog -Pattern "ACP=65001" -Quiet)) {
+            throw "ACP=65001 не найден в $envLog — манифест не применился"
+          }
+          Write-Host "OK: кириллический путь, ACP=65001"
 
       - uses: actions/upload-artifact@v4
         with:
           name: Transkrib-${{ matrix.variant }}-${{ matrix.name }}
-          path: Transkrib-${{ matrix.variant }}-${{ matrix.name }}.zip
+          path: ${{ env.ZIP_NAME }}
           compression-level: 0
 
   release:
