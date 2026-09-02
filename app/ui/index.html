@@ -89,6 +89,7 @@
 <body>
 <header>
   <h1>Transkrib</h1>
+  <span class="badge" id="verBadge" style="cursor:pointer">…</span>
   <span class="badge" id="hw">…</span>
   <div class="tabs">
     <div class="tab active" data-tab="tr">Расшифровка</div>
@@ -151,6 +152,8 @@
 <div class="modal" id="modal">
   <div class="card">
     <h2>Настройки</h2>
+    <div class="row"><label>Версия</label><span id="sVersion" style="flex:1;color:var(--text)"></span>
+      <button id="btnCheckUpdates">Проверить обновления</button></div>
     <div class="row"><label>Модель</label><select id="sModel"></select></div>
     <div class="hint" id="sModelHint"></div>
     <div class="row"><label>Язык речи</label><select id="sLang"></select></div>
@@ -208,6 +211,37 @@ async function api(name, ...args) {
 }
 function errMsg(err) { return (err && err.message) ? err.message : String(err); }
 
+// ── папки и лог: Python теперь всегда отдаёт {ok, error}, а не бросает
+// исключение (А7) — сами решаем, показывать ли тост, а не полагаемся на catch.
+async function openFolder(path) {
+  let r;
+  try { r = await api('open_folder', path); } catch { return; }
+  if (r && r.ok === false) toast(r.error || 'Не удалось открыть папку');
+}
+async function openLog() {
+  let r;
+  try { r = await api('open_log'); } catch { return; }
+  if (r && r.ok === false) toast(r.error || 'Не удалось открыть лог');
+}
+
+// ── версия и обновления (В5) ────────────────────────────────────────────
+const RELEASES_URL = 'https://github.com/BrimTV/transkrib/releases';
+async function openReleases() {
+  let r;
+  try { r = await api('open_url', RELEASES_URL); } catch { return; }
+  if (r && r.ok === false) toast(r.error || 'Не удалось открыть страницу релизов');
+}
+function renderVersionBadge() {
+  const b = INFO.build || {};
+  const ver = b.version || INFO.version;
+  $('#verBadge').textContent = `Transkrib ${ver}` + (b.variant ? ` · ${b.variant}` : '');
+  const details = [b.date, b.commit].filter(x => x && x !== '-').join(' · ');
+  $('#verBadge').title = (details ? `Собрано: ${details}\n` : '') + 'Нажмите, чтобы открыть страницу релизов';
+  const detailsTxt = details ? ` (${details})` : '';
+  $('#sVersion').textContent = `${ver}${b.variant ? ' · ' + b.variant : ''}${detailsTxt}`;
+}
+$('#verBadge').onclick = openReleases;
+
 // ── инициализация ────────────────────────────────────────────────────────
 window.addEventListener('pywebviewready', init);
 async function init() {
@@ -221,6 +255,7 @@ async function init() {
     INFO.convert_formats.forEach(f => fm.append(new Option(f.toUpperCase(), f)));
     fm.value = 'mp3';
     renderModelBadge();
+    renderVersionBadge();
   } catch (err) {
     showInitError(err);
   }
@@ -230,7 +265,7 @@ function showInitError(err) {
   document.querySelector('header').innerHTML =
     '<h1>Transkrib</h1><span style="color:var(--err)">Не удалось запуститься, см. transkrib.log</span>' +
     '<div class="spacer"></div><button id="btnOpenLog">Открыть лог</button>';
-  $('#btnOpenLog').onclick = () => api('open_log').catch(() => {});
+  $('#btnOpenLog').onclick = openLog;
 }
 function renderModelBadge() {
   const m = INFO.models.find(x => x.key === SET.model) || INFO.models[0];
@@ -546,7 +581,7 @@ $('#btnCopy').onclick = async () => {
 };
 // Автосохранение могло уйти в фолбэк-каталог (папка с файлом недоступна) —
 // «Открыть папку» должна вести туда, где результат реально лежит, не к исходнику.
-$('#btnFolder').onclick = () => current && api('open_folder', current.savedDir || current.path);
+$('#btnFolder').onclick = () => current && openFolder(current.savedDir || current.path);
 $('#chkTime').onchange = e => document.body.classList.toggle('notime', !e.target.checked);
 
 // ── настройки ────────────────────────────────────────────────────────────
@@ -578,7 +613,8 @@ function tsPreview() {
   $('#sTsPreview').textContent = mode === 'none' ? 'Пример: Привет, это проверка…' : `Пример: ${mk(185)} Привет, это проверка…`;
 }
 ['#sTsMode', '#sTsStyle'].forEach(sel => $(sel).onchange = tsPreview);
-$('#btnOpenLogSettings').onclick = () => api('open_log').catch(() => {});
+$('#btnOpenLogSettings').onclick = openLog;
+$('#btnCheckUpdates').onclick = openReleases;
 $('#sClose').onclick = () => $('#modal').classList.remove('show');
 $('#sSave').onclick = async () => {
   SET = await api('set_settings', { model: $('#sModel').value, language: $('#sLang').value,
@@ -608,7 +644,7 @@ function onConvertEvent(e) {
   const st = d.querySelector('.st'), bar = d.querySelector('.bar i');
   if (e.type === 'convert_progress') { bar.style.width = Math.round(e.progress * 100) + '%'; st.textContent = Math.round(e.progress * 100) + '%'; }
   if (e.type === 'convert_done') { bar.style.width = '100%'; st.textContent = 'Готово'; st.className = 'st ok';
-    const b = document.createElement('button'); b.textContent = 'Открыть папку'; b.onclick = () => api('open_folder', e.out); d.append(b); }
+    const b = document.createElement('button'); b.textContent = 'Открыть папку'; b.onclick = () => openFolder(e.out); d.append(b); }
   if (e.type === 'convert_error') { st.textContent = e.msg; st.className = 'st err'; }
 }
 

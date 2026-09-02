@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import traceback
+import webbrowser
 
 from . import __version__, engine, export, media
 
@@ -37,10 +38,43 @@ def _settings_path():
     return os.path.join(engine.data_dir(), "settings.json")
 
 
+def _webview_storage_path():
+    """Профиль WebView2/куки в своей папке данных, а не в роуминговом
+    %APPDATA%\\pywebview (А7): private_mode=False без storage_path создаёт
+    именно там cache_dir (winforms.init_storage) — десятки МБ, которые в
+    доменных окружениях ездят по сети вместе с профилем пользователя. Наш
+    интерфейс не использует ни куки, ни localStorage (всё состояние — в
+    settings.json), так что менять поведение private_mode не нужно: достаточно
+    указать некочующую папку явно, и на Windows, и на macOS (там роуминга нет,
+    но лишний профиль пусть тоже живёт рядом с остальными данными приложения)."""
+    return os.path.join(engine.data_dir(), "webview")
+
+
+# ── версия и обновления (В5) ─────────────────────────────────────────────────
+# Разрешаем open_url только на страницы своего репозитория — метод торчит в JS,
+# и открывать по нему произвольные адреса незачем.
+_ALLOWED_URL_PREFIX = "https://github.com/BrimTV/transkrib"
+
+
+def _build_info():
+    """Блок build из bundled_models/variant.json (версия, короткий хеш коммита,
+    дата, вариант сборки lite/medium) — кладёт build/fetch_model.py. При запуске
+    из исходников (variant.json нет) отдаём безопасную заглушку для шапки UI."""
+    try:
+        with open(os.path.join(engine.bundled_root(), "variant.json"), encoding="utf-8") as f:
+            data = json.load(f)
+        build = data.get("build") or {}
+        if build:
+            return build
+    except Exception:
+        pass
+    return dict(version=__version__, commit="-", date="-", variant="исходники")
+
+
 DEFAULT_SETTINGS = dict(model=engine.DEFAULT_MODEL, language="ru", prefer_gpu=True,
                         autosave=True, autosave_formats=["txt", "srt"],
                         ts_mode="paragraph", ts_interval=60, ts_style="brackets_short",
-                        diarize=False, num_speakers=0)
+                        diarize=False, num_speakers=0, pick_dir="")
 
 
 def load_settings():
@@ -205,7 +239,8 @@ class Api:
             models.append(dict(key=key, label=m["label"], size_mb=m["size_mb"], resolved=key,
                                cached=engine.model_is_cached(key, hw["backend"])))
         from . import diarize
-        return dict(version=__version__, hardware=hw, backend_label=engine.backend_label(hw["backend"]),
+        return dict(version=__version__, build=_build_info(), hardware=hw,
+                    backend_label=engine.backend_label(hw["backend"]),
                     diarize_available=diarize.available(), diarize_models=bool(diarize.model_paths()),
                     models=models, languages=engine.LANGUAGES, settings=load_settings(),
                     models_dir=engine.models_dir(), convert_formats=list(media.CONVERT_PRESETS))
@@ -221,20 +256,75 @@ class Api:
         import webview
         exts = sorted(e.lstrip(".") for e in media.AUDIO_EXT | media.VIDEO_EXT)
         types = ("Аудио и видео (" + ";".join("*." + e for e in exts) + ")", "Все файлы (*.*)")
-        res = self.window.create_file_dialog(webview.OPEN_DIALOG, allow_multiple=True, file_types=types)
-        return [p for p in (res or []) if os.path.isfile(p)]
+        try:
+            for t in types:
+                webview.util.parse_file_type(t)
+        except ValueError as e:
+            # Если кто-то поправит строку описания и сломает формат (слэш, запятая,
+            # точка вне списка расширений), create_file_dialog бросит исключение
+            # ДО открытия диалога, и клик по области выбора файла будет молча
+            # ничего не делать. Проверяем сами и открываем диалог без фильтра типов.
+            engine.log(f"pick_files: некорректное описание типов файлов ({e}), открываю без фильтра")
+            types = ()
+        s = load_settings()
+        # winforms при пустом directory лезет в переменную окружения HOMEPATH,
+        # которой может не быть (падение с KeyError) — всегда передаём
+        # существующий каталог явно: последний, из которого брали файл.
+        last_dir = s.get("pick_dir") or ""
+        if not (last_dir and os.path.isdir(last_dir)):
+            last_dir = os.path.expanduser("~")
+        res = self.window.create_file_dialog(webview.OPEN_DIALOG, directory=last_dir,
+                                             allow_multiple=True, file_types=types)
+        paths = [p for p in (res or []) if os.path.isfile(p)]
+        if paths:
+            s["pick_dir"] = os.path.dirname(paths[0])
+            save_settings(s)
+        return paths
 
     def open_log(self):
-        self.open_folder(engine.data_dir())
+        return self.open_folder(engine.data_dir())
 
     def open_folder(self, path):
-        folder = path if os.path.isdir(path) else os.path.dirname(path)
-        if sys.platform == "win32":
-            os.startfile(folder)  # noqa
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", folder])
-        else:
-            subprocess.Popen(["xdg-open", folder])
+        """Открыть папку в системном файловом менеджере, по возможности выделив
+        в ней файл. os.startfile бросал OSError при сломанной ассоциации типов —
+        исключение улетало в отклонённое promise JS и терялось (А7). Теперь
+        никогда не бросает: всегда словарь ok/error, ошибку JS показывает тостом."""
+        try:
+            is_file = os.path.isfile(path)
+            folder = path if os.path.isdir(path) else (os.path.dirname(path) or ".")
+            if not (is_file or os.path.isdir(folder)):
+                # open/xdg-open/explorer запускаются через Popen и не бросают
+                # исключение сами по себе даже на несуществующий путь (процесс
+                # стартует и падает уже сам, асинхронно) — проверяем заранее.
+                return dict(ok=False, error=f"Папка не найдена: {folder}")
+            if sys.platform == "win32":
+                if is_file:
+                    # /select открывает Проводник с выделенным файлом; не трогает
+                    # ассоциацию типов файла (в отличие от os.startfile на самом
+                    # файле), поэтому не падает на сломанной ассоциации.
+                    subprocess.Popen(["explorer", f"/select,{path}"])
+                else:
+                    os.startfile(folder)  # noqa
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", "-R", path] if is_file else ["open", folder])
+            else:
+                subprocess.Popen(["xdg-open", folder])
+            return dict(ok=True)
+        except Exception as e:
+            engine.log(f"open_folder: не удалось открыть {path} ({e})")
+            return dict(ok=False, error=f"Не удалось открыть папку: {e}")
+
+    def open_url(self, url):
+        """Открывает страницу релизов в системном браузере (В5). Разрешены
+        только адреса собственного репозитория — метод доступен из JS, и
+        открывать по нему произвольные ссылки не нужно."""
+        if not isinstance(url, str) or not url.startswith(_ALLOWED_URL_PREFIX):
+            return dict(ok=False, error="адрес не разрешён")
+        try:
+            webbrowser.open(url)
+            return dict(ok=True)
+        except Exception as e:
+            return dict(ok=False, error=f"Не удалось открыть браузер: {e}")
 
     # ── расшифровка ──────────────────────────────────────────────────────
     def start(self, job_id, path, model, language, prefer_gpu, diarize=False, num_speakers=0):
@@ -537,7 +627,7 @@ def _run_smoke(argv):
             os._exit(2)
 
     threading.Thread(target=watchdog, daemon=True).start()
-    webview.start(private_mode=False)
+    webview.start(private_mode=False, storage_path=_webview_storage_path())
     return 0 if ok.is_set() else 2
 
 
@@ -619,7 +709,7 @@ def main():
     api.window = window
     window.events.loaded += api._wire_dnd
     api.start_housekeeping()
-    webview.start(private_mode=False, debug="--debug" in sys.argv)
+    webview.start(private_mode=False, storage_path=_webview_storage_path(), debug="--debug" in sys.argv)
 
 
 if __name__ == "__main__":
