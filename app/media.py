@@ -145,15 +145,19 @@ def _run(args, timeout=None, on_progress=None, total_sec=None, cancel=None):
 
 
 def probe_info(path):
-    """Длительность в секундах и число аудиодорожек через ffmpeg -i
-    (ffprobe в imageio-ffmpeg нет)."""
+    """Длительность в секундах, число аудиодорожек и частота дискретизации
+    первой дорожки через ffmpeg -i (ffprobe в imageio-ffmpeg нет).
+    sample_rate — только для диагностики (Б6): 8 кГц телефония ничего не
+    меняет в поведении, но полезна в логе при жалобах на качество."""
     proc = subprocess.run([ffmpeg_exe(), "-hide_banner", "-i", path], capture_output=True,
                           text=True, encoding="utf-8", errors="replace", **_NO_WINDOW)
     err = proc.stderr or ""
     m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", err)
     duration = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)) if m else None
     audio_tracks = len(re.findall(r"Stream #\d+:\d+(?:\(\w+\))?:\s*Audio:", err))
-    return dict(duration=duration, audio_tracks=audio_tracks)
+    sr_m = re.search(r"Audio:[^\n]*?(\d+)\s*Hz", err)
+    sample_rate = int(sr_m.group(1)) if sr_m else None
+    return dict(duration=duration, audio_tracks=audio_tracks, sample_rate=sample_rate)
 
 
 def probe_duration(path):
@@ -162,17 +166,57 @@ def probe_duration(path):
     return probe_info(path)["duration"]
 
 
+def _log(msg):
+    """engine.py импортирует media снизу своего файла (см. app/engine.py) — на
+    верхнем уровне этого модуля engine.log ещё не существует, поэтому берём
+    его лениво, в момент вызова, а не через обычный import наверху файла."""
+    try:
+        from . import engine
+        engine.log(msg)
+    except Exception:
+        pass
+
+
+def _measure_volume(path):
+    """mean_volume/max_volume через ffmpeg -af volumedetect: только декодирование
+    без перекодирования, поэтому быстро даже на длинной записи (Б6)."""
+    proc = subprocess.run([ffmpeg_exe(), "-hide_banner", "-i", path, "-af", "volumedetect",
+                          "-f", "null", "-"], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", **_NO_WINDOW)
+    err = proc.stderr or ""
+    mean_m = re.search(r"mean_volume:\s*(-?\d+(?:\.\d+)?)\s*dB", err)
+    max_m = re.search(r"max_volume:\s*(-?\d+(?:\.\d+)?)\s*dB", err)
+    mean = float(mean_m.group(1)) if mean_m else None
+    peak = float(max_m.group(1)) if max_m else None
+    return mean, peak
+
+
 def extract_wav(src, dst, on_progress=None, cancel=None):
     """Любой медиафайл → 16 кГц моно WAV: именно это ест whisper.
     -map 0:a:0 — берём только первую аудиодорожку: без этого в файлах с несколькими
     дорожками (например, из OBS) ffmpeg может сам выбрать не ту, а с явной картой
-    отсутствие звука даёт стабильную строку в stderr (см. FFMPEG_HINTS)."""
+    отсутствие звука даёт стабильную строку в stderr (см. FFMPEG_HINTS).
+
+    Тихие записи (Б6): после VAD (Silero) тихая речь рискует потеряться в
+    порогах. Меряем средний уровень и, если он ниже −30 дБ, переизвлекаем со
+    статическим усилением (не компрессором — компрессор поднял бы и шум в
+    паузах вместе с речью)."""
     info = probe_info(src)
     check_readable(src, duration_sec=info["duration"], tmp_dir=os.path.dirname(dst) or None)
-    _run(["-i", src, "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", dst],
-         on_progress=on_progress, total_sec=info["duration"], cancel=cancel)
+    args = ["-i", src, "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", dst]
+    _run(args, on_progress=on_progress, total_sec=info["duration"], cancel=cancel)
+    # cancel — при взведённом флаге _run уже бросил InterruptedError выше, сюда не дойдём
+    mean, peak = _measure_volume(dst)
+    if mean is not None and mean < -30:
+        gain = min(-20 - mean, -1 - peak) if peak is not None else -20 - mean
+        _log(f"тихая запись: mean_volume={mean:.1f}dB — переизвлекаю с усилением {gain:.1f}dB")
+        _run(["-i", src, "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000",
+              "-af", f"volume={gain:.2f}dB", "-c:a", "pcm_s16le", dst],
+             total_sec=info["duration"], cancel=cancel)
     if on_progress:
         on_progress(1.0)  # длительность контейнера бывает больше звука — добиваем до 100%
+    _log(f"звук: {info['sample_rate']} Гц, дорожек {info['audio_tracks']}"
+        + (" (телефония)" if (info["sample_rate"] or 0) and info["sample_rate"] <= 8000 else ""))
     return wav_duration(dst), info["audio_tracks"]
 
 
@@ -241,3 +285,66 @@ def slice_wav(src, dst, start, end):
     """Вырезать [start, end) из WAV без перекодирования потерь."""
     _run(["-ss", f"{start:.3f}", "-to", f"{end:.3f}", "-i", src, "-ac", "1", "-ar", "16000",
           "-c:a", "pcm_s16le", dst])
+
+
+def wav_slice(path, start, end):
+    """Кусок WAV → float32 массив в диапазоне [-1, 1], без ffmpeg (не тратим
+    процесс на маленький кусок). Перенесено из engine._wav_slice (Б2): нужно
+    и здесь для чтения VAD блоками, и в engine — для нарезки кусков перед
+    моделью (Б2/Б3)."""
+    import numpy as np
+    with wave.open(path, "rb") as w:
+        sr = w.getframerate()
+        w.setpos(int(start * sr))
+        n = int((end - start) * sr)
+        data = w.readframes(n)
+    return np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def speech_regions(wav, total_sec, on_progress=None, cancel=None, block=600.0):
+    """Интервалы речи в WAV через Silero VAD (faster_whisper.vad) — модель
+    уже попадает в сборку через collect_all("faster_whisper") (см. Б2).
+
+    Читаем блоками по `block` секунд (по умолчанию 10 минут), а не всю запись
+    разом: на трёхчасовой записи держать весь звук во float32 в памяти сразу —
+    лишние ≈650 МБ, которых на ноутбуке с 8 ГБ жалко. Регионы на границе блока
+    не теряются: спад речи короче, чем блок, а на стыке двух блоков между ними
+    склеиваем интервалы с промежутком меньше секунды (см. ниже).
+
+    Возвращает список (start, end) в секундах записи, по возрастанию."""
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+    with wave.open(wav, "rb") as w:
+        sr = w.getframerate()
+    opts = VadOptions(threshold=0.5, min_speech_duration_ms=250,
+                      min_silence_duration_ms=500, speech_pad_ms=400)
+    regions = []
+    pos = 0.0
+    while pos < total_sec:
+        if cancel and cancel.is_set():
+            raise InterruptedError("отменено")
+        end = min(pos + block, total_sec)
+        chunk = wav_slice(wav, pos, end)
+        for r in get_speech_timestamps(chunk, opts, sampling_rate=sr):
+            regions.append((pos + r["start"] / sr, pos + r["end"] / sr))
+        if on_progress:
+            on_progress(min(end / total_sec, 1.0))
+        pos = end
+    merged = []
+    for a, b in regions:
+        if merged and a - merged[-1][1] < 1.0:
+            merged[-1] = (merged[-1][0], b)
+        else:
+            merged.append((a, b))
+    return merged
+
+
+def region_gaps(regions, min_gap=0.6):
+    """Середины промежутков между соседними интервалами речи длиннее min_gap —
+    подставляются в cut_points вместо ffmpeg-паузы: режем по настоящим
+    промежуткам между репликами (VAD), а не там, где ffmpeg silencedetect
+    считает тихо (там могла быть тихая музыка без пауз в самой речи)."""
+    gaps = []
+    for (_, end), (start, _) in zip(regions, regions[1:]):
+        if start - end >= min_gap:
+            gaps.append((end + start) / 2)
+    return gaps

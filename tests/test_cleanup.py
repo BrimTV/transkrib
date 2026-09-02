@@ -184,3 +184,22 @@ class TestState:
         # снова считается первой копией и не режется.
         assert f.verdict(seg(0, 1, "Да.")) is None
         assert f.verdict(seg(1, 2, "Да.")) is None
+
+
+class TestSubtitlePrefix:
+    """Короткая строка, начинающаяся со слова «субтитры», — подпись из обучающих
+    субтитров. Вариантов у неё бесконечно много, списком их не покрыть: реальный
+    случай «Субтитры субтитров Н.Новикова» просочился мимо списка на эфире."""
+
+    def test_unknown_subtitle_credit_dropped(self):
+        f = SegmentFilter("ru")
+        assert f.verdict(seg(0, 2, "Субтитры субтитров Н.Новикова")) == "marker"
+
+    def test_another_unknown_credit_dropped(self):
+        f = SegmentFilter("ru")
+        assert f.verdict(seg(0, 2, "Субтитры добавил зритель канала")) == "marker"
+
+    def test_long_sentence_about_subtitles_kept(self):
+        f = SegmentFilter("ru")
+        text = "Субтитры к фильму мы обсудим подробно на следующей неделе вместе с командой"
+        assert f.verdict(seg(0, 5, text)) is None

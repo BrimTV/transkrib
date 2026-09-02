@@ -9,6 +9,7 @@
 Все события уходят в emit(dict) — окно рисует из них прогресс и живой текст.
 """
 import glob
+import logging
 import math
 import os
 import platform
@@ -18,6 +19,7 @@ import tempfile
 import threading
 import time
 import wave
+from logging.handlers import RotatingFileHandler
 
 APP_NAME = "Transkrib"
 
@@ -31,12 +33,51 @@ class UserError(Exception):
 from . import media  # noqa: E402 — после UserError: media.py импортирует его обратно
 
 
+_logger = None
+_logger_lock = threading.Lock()
+
+
+def _get_logger():
+    """logging.Logger с RotatingFileHandler (В3): без ротации transkrib.log рос
+    без ограничений — на машине разработчика раздулся вместе с забытыми
+    temp-папками, а обычный пользователь узнал бы об этом, только когда
+    кончится место на диске. 2 МБ × 2 копии — этого с запасом хватает на историю
+    последних сессий, но файл не растёт бесконечно."""
+    global _logger
+    if _logger is not None:
+        return _logger
+    with _logger_lock:
+        if _logger is not None:
+            return _logger
+        logger = logging.getLogger("transkrib")
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        try:
+            handler = RotatingFileHandler(
+                os.path.join(data_dir(), "transkrib.log"),
+                maxBytes=2 * 1024 * 1024, backupCount=2, encoding="utf-8")
+            handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S"))
+            logger.addHandler(handler)
+        except Exception:
+            pass
+        _logger = logger
+        # Строка-разделитель раз за процесс, при первом реальном обращении к логу:
+        # без версии/платформы/железа по логу от пользователя не понять, какая у
+        # него сборка и какой бэкенд она выбрала.
+        try:
+            from . import __version__
+            logger.info(f"=== Transkrib {__version__} platform={sys.platform} "
+                        f"machine={platform.machine()} {hardware_info()} ===")
+        except Exception:
+            pass
+        return logger
+
+
 def log(msg):
     """Строка в <data_dir>/transkrib.log — единственное место, где видно, почему
     GPU-путь упал: тост в окне живёт 4 секунды."""
     try:
-        with open(os.path.join(data_dir(), "transkrib.log"), "a", encoding="utf-8") as f:
-            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + str(msg) + "\n")
+        _get_logger().info(str(msg))
     except Exception:
         pass
 
@@ -113,6 +154,40 @@ def models_dir():
     d = os.path.join(data_dir(), "models")
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def temp_dir():
+    """Свой временный каталог, а не системный (В3): на Windows системный temp
+    бывает на маленьком диске и/или под кириллическим путём (см. A1), а тут —
+    рядом с моделями, там же, где приложение и так пишет."""
+    d = os.path.join(data_dir(), "tmp")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def cleanup_temp(max_age_sec=3600):
+    """Удалить папки transkrib_* старше max_age_sec — и в своём temp_dir(), и в
+    системном tempfile.gettempdir() (там их оставляли версии до В3). Порог в
+    час не занижать: он же защищает wav второго одновременно запущенного
+    экземпляра приложения от удаления прямо во время его работы. Ошибки
+    удаления (файл занят, нет прав) молча пропускаем — это уборка, а не
+    критичная операция."""
+    now = time.time()
+    for base in (temp_dir(), tempfile.gettempdir()):
+        try:
+            names = os.listdir(base)
+        except OSError:
+            continue
+        for name in names:
+            if not name.startswith("transkrib_"):
+                continue
+            p = os.path.join(base, name)
+            try:
+                if not os.path.isdir(p) or now - os.path.getmtime(p) < max_age_sec:
+                    continue
+                shutil.rmtree(p, ignore_errors=True)
+            except OSError:
+                pass
 
 
 # ── безопасные пути для C++-библиотек на Windows (A1) ──────────────────────────
@@ -238,10 +313,28 @@ def backend_phrase(b):
             "cpu": "на процессоре"}.get(b, b)
 
 
+def _physical_cpu():
+    try:
+        import psutil
+        return psutil.cpu_count(logical=False)
+    except Exception:
+        return None
+
+
+def cpu_workers():
+    """Число потоков под расшифровку/диаризацию. Физические ядра, а не
+    логические: Hyper-Threading/SMT почти не ускоряет числодробительный CPU-
+    инференс, зато psutil.cpu_count() по умолчанию считает и его. На 4+ ядрах
+    оставляем одно свободным — иначе ноутбук греется и интерфейс подтормаживает
+    во время расшифровки (Б4)."""
+    n = _physical_cpu() or os.cpu_count() or 2
+    return n - 1 if n >= 4 else n
+
+
 def hardware_info():
     return dict(platform=sys.platform, machine=platform.machine(), cpu_count=os.cpu_count(),
-                mlx=_has_mlx(), cuda=_has_cuda(), backend=detect_backend(),
-                bundled_model=bundled_model_key())
+                physical_cpu=_physical_cpu(), mlx=_has_mlx(), cuda=_has_cuda(),
+                backend=detect_backend(), bundled_model=bundled_model_key())
 
 
 # ── скачивание моделей ───────────────────────────────────────────────────────
@@ -377,8 +470,9 @@ def load_model(model_key, backend, emit, cancel=None):
         if backend == "cuda":
             obj = WhisperModel(path, device="cuda", compute_type="float16")
         else:
-            obj = WhisperModel(path, device="cpu", compute_type="int8",
-                               cpu_threads=max(1, (os.cpu_count() or 4)))
+            workers = cpu_workers()
+            log(f"cpu_threads={workers} (физических {_physical_cpu()})")
+            obj = WhisperModel(path, device="cpu", compute_type="int8", cpu_threads=workers)
     with _loaded_lock:
         _loaded.clear()   # держим в памяти одну модель: они по 1.5–3 ГБ
         _loaded[key] = obj
@@ -449,82 +543,122 @@ def _friendly_error(e):
     return None
 
 
+# ── резка на куски по речи (Б2/Б3) ────────────────────────────────────────────
+def _pieces(total_sec, regions, target=120.0, max_len=150.0):
+    """Границы кусков [a,b), покрывающие всю запись целиком, на промежутках
+    между репликами (media.region_gaps по интервалам VAD), а не там, где вообще
+    тихо по ffmpeg silencedetect — в тихой музыке пауз в речи может не быть
+    совсем. target/max_len разные для двух вызовов: у MLX умолчания дают куски
+    ~2 мин, как было раньше (Б2); faster-whisper зовут с 750/900 — куски
+    10-15 мин, чтобы не decode'ить и не считать лог-мел на файл целиком (Б3)."""
+    gaps = media.region_gaps(regions, min_gap=0.6)
+    bounds = [0.0] + media.cut_points(total_sec, gaps, target=target, max_len=max_len) + [total_sec]
+    return list(zip(bounds, bounds[1:]))
+
+
 # ── расшифровка ──────────────────────────────────────────────────────────────
-def _transcribe_fw(model, wav, language, backend, emit, cancel, total_sec):
-    segments, info = model.transcribe(
-        wav, language=None if language == "auto" else language,
-        beam_size=5 if backend == "cuda" else 1,
-        vad_filter=True, vad_parameters=dict(min_silence_duration_ms=500),
-        condition_on_previous_text=False,
-    )
-    if language == "auto":
-        emit(dict(type="stage", stage="lang", msg=f"Язык: {info.language} ({info.language_probability:.0%})"))
-    for s in segments:
+def _transcribe_fw(model, wav, language, backend, emit, cancel, total_sec, regions):
+    """Кусками по 10-15 минут (Б3), а не файлом целиком: faster-whisper иначе
+    декодирует весь файл в float32 (3 ч ≈ 690 МБ) и считает лог-мел на всю
+    запись (ещё ≈550 МБ) — пик под 2 ГБ поверх памяти модели, на ноутбуке с
+    8 ГБ почти всё. Заодно отмена и прогресс работают между кусками, а не
+    только после того, как whisper досчитает файл целиком. При auto языке
+    определяем его на первом куске и дальше передаём явно — иначе whisper
+    заново гадает на каждом куске, а конец файла в другом языке путает его."""
+    pieces = _pieces(total_sec, regions or [(0.0, total_sec)], target=750.0, max_len=900.0)
+    lang = None if language == "auto" else language
+    for a, b in pieces:
         if cancel and cancel.is_set():
             raise InterruptedError("отменено")
-        text = s.text.strip()
-        if text:
-            # Показатели качества сегмента отдают оба движка; фильтр галлюцинаций
-            # без них слепнет на самых надёжных признаках (тишина и зацикливание).
-            emit(dict(type="segment", start=s.start, end=s.end, text=text,
-                      no_speech_prob=getattr(s, "no_speech_prob", None),
-                      avg_logprob=getattr(s, "avg_logprob", None),
-                      compression_ratio=getattr(s, "compression_ratio", None)))
-        emit(dict(type="progress", done_sec=s.end, total_sec=total_sec))
+        chunk = media.wav_slice(wav, a, b)
+        segments, info = model.transcribe(
+            chunk, language=lang, beam_size=5 if backend == "cuda" else 1,
+            vad_filter=True, vad_parameters=dict(min_silence_duration_ms=500),
+            condition_on_previous_text=False,
+        )
+        if lang is None:
+            lang = info.language
+            emit(dict(type="stage", stage="lang", msg=f"Язык: {info.language} ({info.language_probability:.0%})"))
+        for s in segments:
+            if cancel and cancel.is_set():
+                raise InterruptedError("отменено")
+            text = s.text.strip()
+            if text:
+                # Показатели качества сегмента отдают оба движка; фильтр галлюцинаций
+                # без них слепнет на самых надёжных признаках (тишина и зацикливание).
+                emit(dict(type="segment", start=a + s.start, end=a + s.end, text=text,
+                          no_speech_prob=getattr(s, "no_speech_prob", None),
+                          avg_logprob=getattr(s, "avg_logprob", None),
+                          compression_ratio=getattr(s, "compression_ratio", None)))
+        emit(dict(type="progress", done_sec=b, total_sec=total_sec))
 
 
-def _wav_slice(path, start, end):
-    """Кусок 16 кГц моно WAV → float32 массив, без ffmpeg."""
-    import numpy as np
-    with wave.open(path, "rb") as w:
-        sr = w.getframerate()
-        w.setpos(int(start * sr))
-        n = int((end - start) * sr)
-        data = w.readframes(n)
-    return np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-
-
-def _transcribe_mlx(model_path, wav, language, emit, cancel, total_sec):
-    """MLX не стримит сегменты — режем файл по паузам на куски ~2 мин и отдаём
-    результат по кускам. Швы на паузах, поэтому фраз не теряем.
+def _transcribe_mlx(model_path, wav, language, emit, cancel, total_sec, regions):
+    """MLX не стримит сегменты и не умеет vad_filter сам (в отличие от
+    faster-whisper) — поэтому границы кусков и участки внутри них берём из
+    regions, интервалов речи, которые заранее нашёл Silero VAD
+    (media.speech_regions, Б2). Раньше куски по 120-150 с уходили в модель
+    целиком, вместе с музыкой и тишиной, и там MLX галлюцинировал чаще, чем
+    faster-whisper.
 
     Звук отдаём массивом, а не путём: по пути mlx_whisper зовёт `ffmpeg` из PATH,
     а у приложения, запущенного из Finder, PATH системный и ffmpeg там нет
     (2026-09-02, «[Errno 2] No such file or directory: 'ffmpeg'» → CPU-фолбэк)."""
     import mlx_whisper
-    silences = media.silence_midpoints(wav, cancel=cancel) if total_sec > 150 else []
-    bounds = [0.0] + media.cut_points(total_sec, silences) + [total_sec]
-    tmpdir = tempfile.mkdtemp(prefix="transkrib_")
-    try:
-        for i, (a, b) in enumerate(zip(bounds, bounds[1:])):
-            if cancel and cancel.is_set():
-                raise InterruptedError("отменено")
-            piece = wav
-            res = mlx_whisper.transcribe(
-                _wav_slice(wav, a, b), path_or_hf_repo=model_path,
-                language=None if language == "auto" else language,
-                condition_on_previous_text=False, fp16=True,
-            )
-            try:
-                import mlx.core as mx
-                mx.clear_cache()   # иначе буферный кэш растёт на каждую новую длину куска
-            except Exception:
-                pass
-            if i == 0 and language == "auto":
-                emit(dict(type="stage", stage="lang", msg=f"Язык: {res.get('language')}"))
-            for s in res.get("segments", []):
-                text = (s.get("text") or "").strip()
-                if text:
-                    emit(dict(type="segment", start=a + s["start"], end=a + s["end"], text=text,
-                              no_speech_prob=s.get("no_speech_prob"),
-                              avg_logprob=s.get("avg_logprob"),
-                              compression_ratio=s.get("compression_ratio")))
+    if regions is not None and not regions:
+        # VAD отработал, но речи нет вообще — не гоняем модель по музыке/тишине зря.
+        emit(dict(type="stage", stage="vad", note=True, msg="Речи в записи не найдено"))
+        emit(dict(type="progress", done_sec=total_sec, total_sec=total_sec))
+        return
+    if regions is not None:
+        pieces = _pieces(total_sec, regions)
+        speech = regions
+    else:
+        # VAD упал (см. лог) — старый запасной путь: резать по паузам ffmpeg,
+        # кусок отдаём целиком, как было раньше.
+        silences = media.silence_midpoints(wav, cancel=cancel) if total_sec > 150 else []
+        bounds = [0.0] + media.cut_points(total_sec, silences) + [total_sec]
+        pieces = list(zip(bounds, bounds[1:]))
+        speech = [(0.0, total_sec)]
+
+    lang_announced = language != "auto"
+    for a, b in pieces:
+        if cancel and cancel.is_set():
+            raise InterruptedError("отменено")
+        overlap = [(max(s, a), min(e, b)) for s, e in speech if e > a and s < b]
+        if not overlap:
             emit(dict(type="progress", done_sec=b, total_sec=total_sec))
-    finally:
+            continue
+        piece_len = b - a
+        speech_sec = sum(e - s for s, e in overlap)
+        clip = "0"  # тишины в куске < 20% — отдаём целиком, как раньше
+        if piece_len > 0 and (1 - speech_sec / piece_len) >= 0.2:
+            clip = []
+            for s, e in overlap:
+                clip += [round(s - a, 3), round(e - a, 3)]
+        res = mlx_whisper.transcribe(
+            media.wav_slice(wav, a, b), path_or_hf_repo=model_path,
+            language=None if language == "auto" else language,
+            condition_on_previous_text=False, fp16=True,
+            no_speech_threshold=0.6, logprob_threshold=-1.0,
+            clip_timestamps=clip,
+        )
         try:
-            os.rmdir(tmpdir)
-        except OSError:
+            import mlx.core as mx
+            mx.clear_cache()   # иначе буферный кэш растёт на каждую новую длину куска
+        except Exception:
             pass
+        if not lang_announced:
+            emit(dict(type="stage", stage="lang", msg=f"Язык: {res.get('language')}"))
+            lang_announced = True
+        for s in res.get("segments", []):
+            text = (s.get("text") or "").strip()
+            if text:
+                emit(dict(type="segment", start=a + s["start"], end=a + s["end"], text=text,
+                          no_speech_prob=s.get("no_speech_prob"),
+                          avg_logprob=s.get("avg_logprob"),
+                          compression_ratio=s.get("compression_ratio")))
+        emit(dict(type="progress", done_sec=b, total_sec=total_sec))
 
 
 def transcribe_file(src, model_key, language, emit, cancel=None, prefer_gpu=True,
@@ -533,7 +667,7 @@ def transcribe_file(src, model_key, language, emit, cancel=None, prefer_gpu=True
     diarize=True — параллельно считаем говорящих и в конце шлём событие speakers."""
     cancel = cancel or threading.Event()
     t_start = time.time()
-    tmpdir = tempfile.mkdtemp(prefix="transkrib_")
+    tmpdir = tempfile.mkdtemp(prefix="transkrib_", dir=temp_dir())
     wav = os.path.join(tmpdir, "audio.wav")
     log(f"start {src} model={model_key} lang={language} gpu={prefer_gpu} diarize={diarize}")
 
@@ -569,6 +703,24 @@ def transcribe_file(src, model_key, language, emit, cancel=None, prefer_gpu=True
         if cancel.is_set():
             raise InterruptedError("отменено")
 
+        # Поиск речи (Б2/Б3) — один раз на весь файл, до выбора бэкенда: границы
+        # кусков одинаковы что для MLX, что для faster-whisper, и если GPU-путь
+        # ниже упадёт и мы откатимся на cpu, пересчитывать VAD незачем.
+        # Цена — примерно 1-2% длительности записи, отсюда и своя стадия прогресса.
+        emit(dict(type="stage", stage="vad", msg="Ищу речь"))
+        try:
+            regions = media.speech_regions(
+                wav, total_sec, on_progress=lambda p: emit(dict(type="vad_progress", progress=p)),
+                cancel=cancel)
+        except InterruptedError:
+            raise
+        except Exception as e:
+            import traceback
+            log(f"VAD FAILED, откат на резку по ffmpeg-паузам:\n{traceback.format_exc()}")
+            regions = None
+        if cancel.is_set():
+            raise InterruptedError("отменено")
+
         backend = detect_backend(prefer_gpu)
         requested = model_key
         while True:
@@ -580,9 +732,9 @@ def transcribe_file(src, model_key, language, emit, cancel=None, prefer_gpu=True
                 emit(dict(type="stage", stage="transcribe", backend=backend,
                           msg=f"Распознаю {backend_phrase(backend)}"))
                 if backend == "mlx":
-                    _transcribe_mlx(model, wav, language, emit, cancel, total_sec)
+                    _transcribe_mlx(model, wav, language, emit, cancel, total_sec, regions)
                 else:
-                    _transcribe_fw(model, wav, language, backend, emit, cancel, total_sec)
+                    _transcribe_fw(model, wav, language, backend, emit, cancel, total_sec, regions)
                 break
             except InterruptedError:
                 raise
@@ -601,10 +753,14 @@ def transcribe_file(src, model_key, language, emit, cancel=None, prefer_gpu=True
             # диаризация ещё и тяжёлая сама по себе.
             from . import diarize as _diar
             avail = memory_available_gb()
-            if avail is not None and avail < 2.5:
+            long_file = total_sec > 3600  # дольше часа — выгружаем всегда, не дожидаясь нехватки памяти
+            if long_file or (avail is not None and avail < 2.5):
                 unload_models()
-                log(f"unload before diarization: {avail:.1f} GB free")
-            emit(dict(type="stage", stage="diarize", msg="Текст готов, определяю говорящих"))
+                log("unload before diarization: " +
+                    ("запись длиннее часа" if long_file else f"{avail:.1f} GB free"))
+            # 0.05× длительности — сложившаяся на практике оценка при шаге окна 0.5 (см. diarize.py)
+            eta = _fmt_dur(total_sec * 0.05)
+            emit(dict(type="stage", stage="diarize", msg=f"Текст готов, определяю говорящих (≈{eta})"))
             try:
                 turns = _diar.run_in_worker(wav, emit, num_speakers, cancel)
                 n = len({t["speaker"] for t in turns})
@@ -668,39 +824,45 @@ def selftest(model_key=None):
         except Exception:
             pass
     print("hardware:", hardware_info())
-    tmp = tempfile.mkdtemp(prefix="transkrib_selftest_")
-    src = os.path.join(tmp, "tone.wav")
-    with wave.open(src, "wb") as w:
-        w.setnchannels(1); w.setsampwidth(2); w.setframerate(22050)
-        frames = bytearray()
-        for i in range(22050 * 3):
-            v = int(8000 * math.sin(2 * math.pi * 440 * i / 22050))
-            frames += int(v).to_bytes(2, "little", signed=True)
-        w.writeframes(bytes(frames))
-    events = []
-
-    def emit(e):
-        events.append(e)
-        if e["type"] in ("stage", "done", "error", "segment", "cancelled"):
-            print(e)
-    transcribe_file(src, model_key, "ru", emit)
-    ok = any(e["type"] == "done" for e in events)
-    # Диаризация: если модели в сборке — проверяем, что библиотека и модели грузятся.
+    tmp = tempfile.mkdtemp(prefix="transkrib_selftest_", dir=temp_dir())
     try:
-        from . import diarize
-        if diarize.available() and diarize.model_paths():
-            wav16 = os.path.join(tmp, "tone16.wav")
-            media.extract_wav(src, wav16)
-            # run_in_worker, а не run(): проверяет, что перезапуск собственного
-            # бинарника с флагом --diarize-worker реально работает (A3) — то же,
-            # что использует transcribe_file в обычной работе.
-            turns = diarize.run_in_worker(wav16, lambda e: None)
-            print(f"diarization: ok (через воркер), реплик на синтетическом тоне: {len(turns)}")
-        else:
-            print("diarization: модели не вшиты, пропускаю")
-    except Exception as e:
-        print("diarization: FAILED", e)
-        ok = False
+        src = os.path.join(tmp, "tone.wav")
+        with wave.open(src, "wb") as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(22050)
+            frames = bytearray()
+            for i in range(22050 * 3):
+                v = int(8000 * math.sin(2 * math.pi * 440 * i / 22050))
+                frames += int(v).to_bytes(2, "little", signed=True)
+            w.writeframes(bytes(frames))
+        events = []
+
+        def emit(e):
+            events.append(e)
+            if e["type"] in ("stage", "done", "error", "segment", "cancelled"):
+                print(e)
+        transcribe_file(src, model_key, "ru", emit)
+        ok = any(e["type"] == "done" for e in events)
+        # Диаризация: если модели в сборке — проверяем, что библиотека и модели грузятся.
+        try:
+            from . import diarize
+            if diarize.available() and diarize.model_paths():
+                wav16 = os.path.join(tmp, "tone16.wav")
+                media.extract_wav(src, wav16)
+                # run_in_worker, а не run(): проверяет, что перезапуск собственного
+                # бинарника с флагом --diarize-worker реально работает (A3) — то же,
+                # что использует transcribe_file в обычной работе.
+                turns = diarize.run_in_worker(wav16, lambda e: None)
+                print(f"diarization: ok (через воркер), реплик на синтетическом тоне: {len(turns)}")
+            else:
+                print("diarization: модели не вшиты, пропускаю")
+        except Exception as e:
+            print("diarization: FAILED", e)
+            ok = False
+    finally:
+        # Самопроверка не должна оставлять за собой мусор (В3) — иначе после
+        # каждого запуска --selftest в CI и на машине разработчика копится
+        # ровно то, из-за чего temp и завели: заброшенные transkrib_* папки.
+        shutil.rmtree(tmp, ignore_errors=True)
     print("SELFTEST", "OK" if ok else "FAILED")
     return 0 if ok else 1
 

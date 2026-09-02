@@ -606,6 +606,11 @@ def main():
     from . import winprep
     winprep.require_ui_runtime()
 
+    # Уборка в фоне: прерванная или упавшая задача оставляет wav на сотни мегабайт,
+    # и у человека это копится незаметно, пока не кончится место (у нас за день
+    # набежало 1.4 ГБ). Порог в час защищает файлы второго запущенного экземпляра.
+    threading.Thread(target=engine.cleanup_temp, daemon=True).start()
+
     import webview
     api = Api()
     window = webview.create_window(f"Transkrib {__version__}", _ui_path(), js_api=api,
