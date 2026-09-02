@@ -515,6 +515,19 @@ def selftest(model_key=None):
             print(e)
     transcribe_file(src, model_key, "ru", emit)
     ok = any(e["type"] == "done" for e in events)
+    # Диаризация: если модели в сборке — проверяем, что библиотека и модели грузятся.
+    try:
+        from . import diarize
+        if diarize.available() and diarize.model_paths():
+            wav16 = os.path.join(tmp, "tone16.wav")
+            media.extract_wav(src, wav16)
+            turns = diarize.run(wav16, lambda e: None)
+            print(f"diarization: ok, реплик на синтетическом тоне: {len(turns)}")
+        else:
+            print("diarization: модели не вшиты, пропускаю")
+    except Exception as e:
+        print("diarization: FAILED", e)
+        ok = False
     print("SELFTEST", "OK" if ok else "FAILED")
     return 0 if ok else 1
 

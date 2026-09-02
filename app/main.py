@@ -214,6 +214,33 @@ def main():
             sys.stdout = sys.stderr = Tee()
             sys.exit(engine.selftest())
 
+    if "--cli" in sys.argv:
+        # Transkrib --cli файл [--speakers] [--model small] [--lang ru] — без окна, события в stdout
+        args = sys.argv[sys.argv.index("--cli") + 1:]
+        path = next((a for a in args if not a.startswith("--")), None)
+        if not path:
+            sys.exit("укажите файл")
+        opt = lambda k, d: args[args.index(k) + 1] if k in args else d  # noqa: E731
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+        segs = []
+
+        def show(e):
+            if e["type"] == "segment":
+                segs.append(e); print(f"[{e['start']:7.1f}] {e['text']}", flush=True)
+            elif e["type"] == "speakers":
+                from . import diarize
+                diarize.assign(segs, e["turns"]); print(f"говорящих: {e['count']}", flush=True)
+            elif e["type"] in ("stage", "done", "error", "cancelled"):
+                print("::", e["msg"], flush=True)
+        engine.transcribe_file(path, opt("--model", "auto"), opt("--lang", "ru"), show,
+                               diarize="--speakers" in args)
+        print(export.render(segs, "txt", opts=dict(ts_mode="paragraph")))
+        sys.exit(0)
+
     import webview
     api = Api()
     window = webview.create_window(f"Transkrib {__version__}", _ui_path(), js_api=api,
