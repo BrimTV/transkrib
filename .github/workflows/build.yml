@@ -255,6 +255,34 @@ jobs:
 
       # Ни один запуск не должен ходить в сеть: модель вшита в пакет. Глухой прокси
       # ловит любую попытку — у человека без интернета всё обязано работать.
+      # Единственная проверка, которая реально открывает окно: создаёт его, дожидается
+      # загрузки страницы, дёргает мост Python↔JS как это делает интерфейс, проверяет
+      # подписку на перетаскивание файлов и закрывается. Всё остальное в CI headless,
+      # а именно окно и WebView2 — самое хрупкое место на чужой Windows.
+      - name: Окно открывается и мост жив (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "dist\Transkrib\Transkrib-console.exe" --smoke
+          if ($LASTEXITCODE -ne 0) { throw "окно не открылось, код $LASTEXITCODE" }
+          $log = "$env:LOCALAPPDATA\Transkrib\smoke.log"
+          Get-Content $log
+          foreach ($needle in @("READY", "OK", "DND_DISPATCHED")) {
+            if (-not (Select-String -Path $log -Pattern $needle -Quiet)) { throw "в smoke.log нет $needle" }
+          }
+          Write-Host "OK: окно, мост и перетаскивание живы"
+
+      - name: Окно открывается и мост жив (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          ./dist/Transkrib.app/Contents/MacOS/Transkrib-console --smoke
+          log="$HOME/Library/Application Support/Transkrib/smoke.log"
+          cat "$log"
+          for needle in READY OK DND_DISPATCHED; do
+            grep -q "$needle" "$log" || { echo "в smoke.log нет $needle"; exit 1; }
+          done
+          echo "OK: окно, мост и перетаскивание живы"
+
       - name: Работа без интернета (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
