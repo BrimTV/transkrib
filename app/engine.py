@@ -12,15 +12,23 @@ import glob
 import math
 import os
 import platform
+import shutil
 import sys
 import tempfile
 import threading
 import time
 import wave
 
-from . import media
-
 APP_NAME = "Transkrib"
+
+
+class UserError(Exception):
+    """Исключение, чей текст показывается пользователю дословно, без обёртки
+    «не удалось обработать файл» и без traceback в интерфейсе (traceback всё равно
+    уходит в log())."""
+
+
+from . import media  # noqa: E402 — после UserError: media.py импортирует его обратно
 
 
 def log(msg):
@@ -209,6 +217,32 @@ def _dir_size(path):
     return total
 
 
+def _looks_like_no_internet(e):
+    """Похоже ли исключение при скачивании на «нет сети», а не на что-то другое."""
+    try:
+        import requests
+        if isinstance(e, requests.ConnectionError):
+            return True
+    except Exception:
+        pass
+    try:
+        from huggingface_hub.utils import LocalEntryNotFoundError
+        if isinstance(e, LocalEntryNotFoundError):
+            return True
+    except Exception:
+        pass
+    text = str(e)
+    return any(needle in text for needle in ("getaddrinfo", "Max retries", "timed out"))
+
+
+def _download_error(e, model_key, size_gb):
+    if _looks_like_no_internet(e):
+        return UserError(
+            f"Нет доступа к интернету — модель «{model_key}» ({size_gb:.1f} ГБ) скачать не "
+            f"удалось. Проверьте подключение или выберите встроенную модель в настройках")
+    return RuntimeError(f"не удалось скачать модель {model_key}: {e}")
+
+
 def ensure_model(model_key, backend, emit, cancel=None):
     """Скачать модель, если её нет. Прогресс — опросом размера папки кэша:
     у huggingface_hub нет нормального колбэка на байты."""
@@ -221,6 +255,14 @@ def ensure_model(model_key, backend, emit, cancel=None):
     if model_is_cached(model_key, backend):
         return snapshot_download(repo, cache_dir=models_dir(), allow_patterns=patterns,
                                  local_files_only=True)
+
+    size_mb = MODELS[model_key]["size_mb"]
+    need = size_mb * 1024 * 1024 * 1.3
+    free = shutil.disk_usage(models_dir()).free
+    if free < need:
+        raise UserError(
+            f"На диске нет места для модели «{model_key}»: нужно ~{need / 1e6:.0f} МБ, "
+            f"свободно {free / 1e6:.0f} МБ")
 
     emit(dict(type="stage", stage="download", msg=f"Скачиваю модель «{model_key}» (один раз)"))
     total = None
@@ -250,7 +292,7 @@ def ensure_model(model_key, backend, emit, cancel=None):
         emit(dict(type="download", done=done, total=total))
         t.join(0.5)
     if "e" in error:
-        raise RuntimeError(f"не удалось скачать модель {repo}: {error['e']}")
+        raise _download_error(error["e"], model_key, size_mb / 1024)
     emit(dict(type="download", done=total, total=total))
     return result["path"]
 
@@ -338,6 +380,15 @@ def maybe_unload(busy=False):
     return None
 
 
+def _friendly_error(e):
+    """Технические исключения, у которых есть понятная человеку причина, — остальное
+    вызывающий заворачивает в «не удалось обработать файл (техническая деталь: …)»."""
+    text = str(e)
+    if isinstance(e, MemoryError) or "Failed to allocate" in text or "out of memory" in text.lower():
+        return "Не хватает оперативной памяти. Закройте другие программы или выберите модель поменьше"
+    return None
+
+
 # ── расшифровка ──────────────────────────────────────────────────────────────
 def _transcribe_fw(model, wav, language, backend, emit, cancel, total_sec):
     segments, info = model.transcribe(
@@ -376,7 +427,7 @@ def _transcribe_mlx(model_path, wav, language, emit, cancel, total_sec):
     а у приложения, запущенного из Finder, PATH системный и ffmpeg там нет
     (2026-09-02, «[Errno 2] No such file or directory: 'ffmpeg'» → CPU-фолбэк)."""
     import mlx_whisper
-    silences = media.silence_midpoints(wav) if total_sec > 150 else []
+    silences = media.silence_midpoints(wav, cancel=cancel) if total_sec > 150 else []
     bounds = [0.0] + media.cut_points(total_sec, silences) + [total_sec]
     tmpdir = tempfile.mkdtemp(prefix="transkrib_")
     try:
@@ -425,9 +476,13 @@ def transcribe_file(src, model_key, language, emit, cancel=None, prefer_gpu=True
             log(e.get("msg") or f"{e['type']} count={e.get('count')}")
         _emit(e)
     try:
+        media.check_readable(src)  # быстрая проверка до старта: файл есть, не пуст, не облачный плейсхолдер
         emit(dict(type="stage", stage="extract", msg="Извлекаю звуковую дорожку"))
-        total_sec = media.extract_wav(
-            src, wav, on_progress=lambda p: emit(dict(type="extract", progress=p)))
+        total_sec, audio_tracks = media.extract_wav(
+            src, wav, on_progress=lambda p: emit(dict(type="extract", progress=p)), cancel=cancel)
+        if audio_tracks > 1:
+            emit(dict(type="stage", stage="extract", note=True,
+                      msg=f"Дорожек: {audio_tracks}, взята первая"))
         emit(dict(type="stage", stage="extract", msg=f"Звук готов: {_fmt_dur(total_sec)}"))
         if cancel.is_set():
             raise InterruptedError("отменено")
@@ -490,8 +545,12 @@ def transcribe_file(src, model_key, language, emit, cancel=None, prefer_gpu=True
             emit(dict(type="stage", stage="unload", msg=f"Памяти мало ({avail:.1f} ГБ свободно), модель выгружена"))
     except InterruptedError:
         emit(dict(type="cancelled", msg="Остановлено"))
+    except UserError as e:
+        emit(dict(type="error", msg=str(e)))
     except Exception as e:
-        emit(dict(type="error", msg=f"Ошибка: {e}"))
+        import traceback
+        log(f"transcribe_file FAILED on {os.path.basename(src)}:\n{traceback.format_exc()}")
+        emit(dict(type="error", msg=_friendly_error(e) or f"Не удалось обработать файл (техническая деталь: {e})"))
     finally:
         for f in (wav,):
             try:

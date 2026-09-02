@@ -1,5 +1,6 @@
 """Окно приложения: pywebview + мост Python↔JS. Никаких портов и серверов —
 JS зовёт методы Api напрямую, Python толкает события через evaluate_js."""
+import functools
 import json
 import os
 import subprocess
@@ -44,6 +45,7 @@ class Api:
         self.window = None
         self._cancel = None
         self._busy = False
+        self._thread = None
         self._last_push = {}
 
     # ── события в окно ───────────────────────────────────────────────────
@@ -62,6 +64,24 @@ class Api:
             self.window.evaluate_js(f"window.onEngineEvent({payload})")
         except Exception:
             pass
+
+    # ── перетаскивание файлов ────────────────────────────────────────────
+    def _wire_dnd(self):
+        """pywebviewFullPath подставляется в событие drop только если на элемент
+        подписан Python-обработчик (webview/util.py: без него drag-n-drop от
+        cocoa и edgechromium никогда не узнают настоящий путь к файлу — только
+        имя). get_element дёргает evaluate_js, поэтому элементы должны уже быть
+        в DOM — подписываемся из window.events.loaded, не раньше."""
+        for sel, kind in (("#dropTr", "transcribe"), ("#dropCv", "convert")):
+            el = self.window.dom.get_element(sel)
+            if el:
+                el.events.drop += functools.partial(self._on_drop, kind)
+
+    def _on_drop(self, kind, e):
+        files = (e.get("dataTransfer") or {}).get("files") or []
+        paths = [f["pywebviewFullPath"] for f in files if f.get("pywebviewFullPath")]
+        engine.log(f"dnd: {kind} paths={len(paths)}")
+        self._emit(dict(type="dropped", target=kind, paths=paths))
 
     # ── справочная информация ────────────────────────────────────────────
     def info(self):
@@ -105,25 +125,45 @@ class Api:
 
     # ── расшифровка ──────────────────────────────────────────────────────
     def start(self, job_id, path, model, language, prefer_gpu, diarize=False, num_speakers=0):
-        if self._busy:
-            return dict(ok=False, error="уже идёт задача")
-        if not os.path.isfile(path):
-            return dict(ok=False, error="файл не найден")
-        self._busy = True
-        self._cancel = threading.Event()
+        try:
+            if self._busy:
+                # событие done уходит из engine раньше, чем finally потока ниже
+                # сбросит _busy — JS успевает вызвать start следующего файла и
+                # получить отказ, хотя предыдущая задача уже фактически кончилась.
+                # Ждём недолго вместо мгновенного отказа.
+                t = self._thread
+                if t is not None and t.is_alive():
+                    t.join(3.0)
+            if self._busy:
+                return dict(ok=False, error="уже идёт задача")
+            if not os.path.isfile(path):
+                return dict(ok=False, error="файл не найден")
+            cancel = threading.Event()
+            self._cancel = cancel
 
-        def run():
-            try:
-                engine.transcribe_file(path, model, language,
-                                       lambda e: self._emit(e, job_id), self._cancel, prefer_gpu,
-                                       diarize=bool(diarize), num_speakers=int(num_speakers or 0))
-            except Exception as e:
-                self._emit(dict(type="error", msg=f"{e}\n{traceback.format_exc()[-400:]}"), job_id)
-            finally:
-                self._busy = False
+            def run():
+                try:
+                    engine.transcribe_file(path, model, language,
+                                           lambda e: self._emit(e, job_id), cancel, prefer_gpu,
+                                           diarize=bool(diarize), num_speakers=int(num_speakers or 0))
+                except Exception as e:
+                    self._emit(dict(type="error", msg=f"{e}\n{traceback.format_exc()[-400:]}"), job_id)
+                finally:
+                    self._busy = False
 
-        threading.Thread(target=run, daemon=True).start()
-        return dict(ok=True)
+            thread = threading.Thread(target=run, daemon=True)
+            self._thread = thread
+            # _busy выставляем перед стартом, а не после: при мгновенно
+            # завершающейся задаче поток может успеть добежать до finally
+            # раньше, чем управление вернётся сюда, и тогда запись True
+            # поверх его False зависла бы навсегда. Если start() всё же
+            # бросит исключение, его поймает except ниже и сбросит busy.
+            self._busy = True
+            thread.start()
+            return dict(ok=True)
+        except Exception as e:
+            self._busy = False
+            return dict(ok=False, error=f"{e}")
 
     def cancel(self):
         if self._cancel:
@@ -324,6 +364,17 @@ def _run_smoke(argv):
                 lines.append("FAIL: pywebview.api.info() не ответил за 30 с")
         except Exception as e:
             lines.append(f"FAIL: {e}")
+        try:
+            # Синтетический drop без файлов: проверяет, что подписка _wire_dnd
+            # жива и _on_drop реально вызывается (см. A0) — путей не будет,
+            # это нормально, дословный путь проверяется только руками (Г4).
+            window.evaluate_js(
+                "document.querySelector('#dropTr').dispatchEvent("
+                "new DragEvent('drop', {dataTransfer: new DataTransfer(), bubbles: true}))"
+            )
+            lines.append("DND_DISPATCHED")
+        except Exception as e:
+            lines.append(f"FAIL: dnd dispatch {e}")
         if hold > 0:
             time.sleep(hold)
         finish(0 if ok.is_set() else 2)
@@ -331,6 +382,7 @@ def _run_smoke(argv):
     window = webview.create_window(f"Transkrib {__version__}", _ui_path(), js_api=api,
                                    width=1100, height=740, background_color="#111418")
     api.window = window
+    window.events.loaded += api._wire_dnd
     window.events.loaded += on_loaded
 
     def watchdog():
@@ -404,6 +456,7 @@ def main():
                                    width=1100, height=740, min_size=(820, 560),
                                    background_color="#111418")
     api.window = window
+    window.events.loaded += api._wire_dnd
     api.start_housekeeping()
     webview.start(private_mode=False, debug="--debug" in sys.argv)
 

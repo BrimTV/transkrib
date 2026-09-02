@@ -190,18 +190,41 @@ let current = null;     // текущий job
 let running = false;
 let cvJobs = {};
 
+// ── мост к Python: единая точка, чтобы отклонённое обещание не оставляло
+// карточку в «Запуск…» навсегда — исключение всегда попадает в тост и летит выше
+async function api(name, ...args) {
+  try {
+    return await pywebview.api[name](...args);
+  } catch (err) {
+    toast('Ошибка: ' + errMsg(err));
+    throw err;
+  }
+}
+function errMsg(err) { return (err && err.message) ? err.message : String(err); }
+
 // ── инициализация ────────────────────────────────────────────────────────
 window.addEventListener('pywebviewready', init);
 async function init() {
-  INFO = await pywebview.api.info();
-  SET = INFO.settings;
-  const hw = $('#hw');
-  hw.textContent = INFO.backend_label;
-  hw.className = 'badge' + (INFO.hardware.backend !== 'cpu' ? ' gpu' : '');
-  const fm = $('#cvFmt');
-  INFO.convert_formats.forEach(f => fm.append(new Option(f.toUpperCase(), f)));
-  fm.value = 'mp3';
-  renderModelBadge();
+  try {
+    INFO = await api('info');
+    SET = INFO.settings;
+    const hw = $('#hw');
+    hw.textContent = INFO.backend_label;
+    hw.className = 'badge' + (INFO.hardware.backend !== 'cpu' ? ' gpu' : '');
+    const fm = $('#cvFmt');
+    INFO.convert_formats.forEach(f => fm.append(new Option(f.toUpperCase(), f)));
+    fm.value = 'mp3';
+    renderModelBadge();
+  } catch (err) {
+    showInitError(err);
+  }
+}
+function showInitError(err) {
+  console.error(err);
+  document.querySelector('header').innerHTML =
+    '<h1>Transkrib</h1><span style="color:var(--err)">Не удалось запуститься, см. transkrib.log</span>' +
+    '<div class="spacer"></div><button id="btnOpenLog">Открыть лог</button>';
+  $('#btnOpenLog').onclick = () => api('open_log').catch(() => {});
 }
 function renderModelBadge() {
   const m = INFO.models.find(x => x.key === SET.model) || INFO.models[0];
@@ -218,20 +241,23 @@ document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
 });
 
 // ── drag & drop и выбор файлов ───────────────────────────────────────────
+// Настоящий путь к файлу (pywebviewFullPath) в JS-объект File никогда не
+// попадает — его подставляет Python в событие drop (см. Api._on_drop) и
+// присылает отдельным событием 'dropped'. Здесь только подсветка рамки
+// и клик для выбора файла через диалог.
 function wireDrop(el, onFiles) {
-  el.onclick = async () => { const p = await pywebview.api.pick_files(); if (p && p.length) onFiles(p); };
+  el.onclick = async () => { const p = await api('pick_files'); if (p && p.length) onFiles(p); };
   ['dragenter', 'dragover'].forEach(ev => el.addEventListener(ev, e => { e.preventDefault(); el.classList.add('over'); }));
   ['dragleave', 'drop'].forEach(ev => el.addEventListener(ev, e => { e.preventDefault(); el.classList.remove('over'); }));
-  el.addEventListener('drop', e => {
-    const paths = [...e.dataTransfer.files].map(f => f.pywebviewFullPath).filter(Boolean);
-    if (paths.length) onFiles(paths);
-    else toast('Не удалось получить путь к файлу — нажмите на область и выберите файл');
-  });
 }
 document.addEventListener('dragover', e => e.preventDefault());
 document.addEventListener('drop', e => e.preventDefault());
 wireDrop($('#dropTr'), addToQueue);
 wireDrop($('#dropCv'), addToConvert);
+function onDropped(e) {
+  if (e.paths && e.paths.length) (e.target === 'convert' ? addToConvert : addToQueue)(e.paths);
+  else toast('Не удалось получить путь к файлу — нажмите на область и выберите файл');
+}
 
 // ── очередь расшифровки ──────────────────────────────────────────────────
 function addToQueue(paths) {
@@ -259,12 +285,30 @@ async function pump() {
   const next = jobs.find(j => j.status === 'queued');
   if (!next) return;
   running = true;
-  next.status = 'running'; next.msg = 'Запуск…';
+  next.status = 'running'; next.msg = 'Запуск…'; next.startedAt = Date.now();
   showJob(next);
-  const r = await pywebview.api.start(next.id, next.path, SET.model, SET.language, SET.prefer_gpu, !!SET.diarize, SET.num_speakers || 0);
-  if (!r.ok) { next.status = 'error'; next.msg = r.error; running = false; renderQueue(); pump(); }
   $('#btnCancel').disabled = false;
+  let r;
+  try { r = await api('start', next.id, next.path, SET.model, SET.language, SET.prefer_gpu, !!SET.diarize, SET.num_speakers || 0); }
+  catch (err) { r = { ok: false, error: errMsg(err) }; }
+  if (!r.ok) {
+    next.status = 'error'; next.msg = r.error;
+    running = false; $('#btnCancel').disabled = true;
+    renderQueue(); pump();
+  }
 }
+// Сторожевой таймер: если карточка застряла на «Запуск…» дольше 120 с и не
+// получила ни одного события (стадия скачивания/диаризации меняет msg и
+// снимает карточку с проверки), значит движок не ответил — освобождаем очередь.
+setInterval(() => {
+  for (const j of jobs) {
+    if (j.status === 'running' && j.msg === 'Запуск…' && j.startedAt && Date.now() - j.startedAt > 120000) {
+      j.status = 'error'; j.msg = 'Движок не ответил';
+      running = false; $('#btnCancel').disabled = true;
+      renderQueue(); pump();
+    }
+  }
+}, 5000);
 function showJob(j) {
   current = j; lastSpk = null;
   renderQueue();
@@ -305,9 +349,16 @@ function setBar(p, indet) {
 const mb = n => (n / 1048576).toFixed(0) + ' МБ';
 
 // ── события из Python ────────────────────────────────────────────────────
+// Без try/catch исключение здесь молча гасится в Api._emit (except: pass),
+// и очередь замирает: карточка навсегда остаётся в «Запуск…».
 window.onEngineEvent = function (e) {
+  try { onEngineEventInner(e); }
+  catch (err) { console.error(err); toast('Ошибка обработки события: ' + errMsg(err)); }
+};
+function onEngineEventInner(e) {
   if (e.type.startsWith('convert_')) return onConvertEvent(e);
   if (e.type === 'info') return toast(e.msg);
+  if (e.type === 'dropped') return onDropped(e);
   const j = jobs.find(x => x.id === e.job); if (!j) return;
   const isCur = current && current.id === j.id;
   switch (e.type) {
@@ -350,7 +401,7 @@ window.onEngineEvent = function (e) {
   }
   if (isCur) { $('#stMsg').textContent = j.msg; $('#stPct').textContent = j.pct || ''; setBar(j.progress ?? 0, j.progress == null && j.status === 'running'); }
   renderQueue();
-};
+}
 // ── говорящие ──────────────────────────────────────────────────────────
 function assignOne(seg, turns) {
   let best = null, bestOv = 0;
@@ -372,26 +423,26 @@ async function finishJob(j, ok = true) {
   running = false; $('#btnCancel').disabled = true;
   const c = $('#cur'); if (c) c.remove();
   if (ok && SET.autosave && j.segments.length) {
-    try { const w = await pywebview.api.autosave(j.path, withNames(j), SET.autosave_formats || ['txt', 'srt']);
-      toast('Сохранено: ' + w.map(x => x.split(/[\\/]/).pop()).join(', ')); } catch (err) { toast('Не удалось сохранить: ' + err); }
+    try { const w = await api('autosave', j.path, withNames(j), SET.autosave_formats || ['txt', 'srt']);
+      toast('Сохранено: ' + w.map(x => x.split(/[\\/]/).pop()).join(', ')); } catch (err) { toast('Не удалось сохранить: ' + errMsg(err)); }
   }
   pump();
 }
 
 // ── кнопки ───────────────────────────────────────────────────────────────
-$('#btnCancel').onclick = () => pywebview.api.cancel();
+$('#btnCancel').onclick = () => api('cancel');
 document.querySelectorAll('.save').forEach(b => b.onclick = async () => {
   if (!current) return;
-  const out = await pywebview.api.save_as(withNames(current), b.dataset.fmt, current.name.replace(/\.[^.]+$/, ''));
+  const out = await api('save_as', withNames(current), b.dataset.fmt, current.name.replace(/\.[^.]+$/, ''));
   if (out) toast('Сохранено: ' + out);
 });
 $('#btnCopy').onclick = async () => {
   if (!current) return;
-  const txt = await pywebview.api.render(withNames(current), 'txt');
+  const txt = await api('render', withNames(current), 'txt');
   try { await navigator.clipboard.writeText(txt); toast('Текст скопирован'); }
   catch { const ta = document.createElement('textarea'); ta.value = txt; document.body.append(ta); ta.select(); document.execCommand('copy'); ta.remove(); toast('Текст скопирован'); }
 };
-$('#btnFolder').onclick = () => current && pywebview.api.open_folder(current.path);
+$('#btnFolder').onclick = () => current && api('open_folder', current.path);
 $('#chkTime').onchange = e => document.body.classList.toggle('notime', !e.target.checked);
 
 // ── настройки ────────────────────────────────────────────────────────────
@@ -425,7 +476,7 @@ function tsPreview() {
 ['#sTsMode', '#sTsStyle'].forEach(sel => $(sel).onchange = tsPreview);
 $('#sClose').onclick = () => $('#modal').classList.remove('show');
 $('#sSave').onclick = async () => {
-  SET = await pywebview.api.set_settings({ model: $('#sModel').value, language: $('#sLang').value,
+  SET = await api('set_settings', { model: $('#sModel').value, language: $('#sLang').value,
     prefer_gpu: $('#sGpu').checked, autosave: $('#sAuto').checked,
     ts_mode: $('#sTsMode').value, ts_interval: Number($('#sTsInt').value), ts_style: $('#sTsStyle').value,
     diarize: $('#sDiar').checked, num_speakers: Number($('#sSpk').value) });
@@ -441,7 +492,9 @@ async function addToConvert(paths) {
     d.innerHTML = `<div class="name">${p.split(/[\\/]/).pop()} → ${fmt.toUpperCase()}</div><div class="bar"><i></i></div><div class="st">0%</div>`;
     $('#cvList').prepend(d);
     cvJobs[id] = { path: p };
-    const r = await pywebview.api.convert(id, p, fmt);
+    let r;
+    try { r = await api('convert', id, p, fmt); }
+    catch (err) { r = { ok: false, error: errMsg(err) }; }
     if (!r.ok) { d.querySelector('.st').textContent = r.error; d.querySelector('.st').className = 'st err'; }
   }
 }
@@ -450,7 +503,7 @@ function onConvertEvent(e) {
   const st = d.querySelector('.st'), bar = d.querySelector('.bar i');
   if (e.type === 'convert_progress') { bar.style.width = Math.round(e.progress * 100) + '%'; st.textContent = Math.round(e.progress * 100) + '%'; }
   if (e.type === 'convert_done') { bar.style.width = '100%'; st.textContent = 'Готово'; st.className = 'st ok';
-    const b = document.createElement('button'); b.textContent = 'Открыть папку'; b.onclick = () => pywebview.api.open_folder(e.out); d.append(b); }
+    const b = document.createElement('button'); b.textContent = 'Открыть папку'; b.onclick = () => api('open_folder', e.out); d.append(b); }
   if (e.type === 'convert_error') { st.textContent = e.msg; st.className = 'st err'; }
 }
 

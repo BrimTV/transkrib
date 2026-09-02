@@ -42,6 +42,15 @@ def silence60(tmp_path_factory):
 
 
 @pytest.fixture(scope="session")
+def long_silence_wav(tmp_path_factory):
+    """30 минут тишины, исходник для теста отмены ffmpeg (A7): длинный файл нужен,
+    чтобы извлечение звука ещё шло, когда тест взводит cancel."""
+    path = tmp_path_factory.mktemp("fixtures") / "long_silence.wav"
+    _ffmpeg("-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono", "-t", "1800", str(path))
+    return path
+
+
+@pytest.fixture(scope="session")
 def music60(tmp_path_factory):
     """60 с синтетической «музыки» (тон с тремоло) — не речь, повод для фильтра галлюцинаций."""
     path = tmp_path_factory.mktemp("fixtures") / "music60.wav"

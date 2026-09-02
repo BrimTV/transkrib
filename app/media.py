@@ -6,9 +6,14 @@ Windows x64 и macOS arm64, поэтому ничего отдельно кач�
 """
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 import wave
+
+from .engine import UserError
 
 # Консольное окно ffmpeg не должно всплывать поверх приложения на Windows.
 _NO_WINDOW = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
@@ -29,6 +34,20 @@ CONVERT_PRESETS = {
     "gif":  ["-vf", "fps=12,scale=480:-1:flags=lanczos", "-an"],
 }
 
+# Подстрока в stderr ffmpeg → понятный текст для человека. Нет совпадения — отдаём
+# хвост stderr как раньше (его дальше в engine.transcribe_file завернут в
+# «техническая деталь»). Порядок важен: проверяем по очереди, первое совпадение побеждает.
+FFMPEG_HINTS = [
+    # На ffmpeg 7.1 (наш бинарник из imageio-ffmpeg) при отсутствии звука в файле
+    # -map 0:a:0 не резолвится вообще, и подстрока в stderr — «Stream map ''»,
+    # а не «Stream map '0:a:0'»: проверено на noaudio.mp4 (см. tests/test_media.py).
+    ("matches no streams", "В этом видео нет звуковой дорожки"),
+    ("Invalid data found", "Не удалось прочитать файл как аудио или видео: он повреждён или недокачан"),
+    ("moov atom not found", "Не удалось прочитать файл как аудио или видео: он повреждён или недокачан"),
+    ("Permission denied", "Нет доступа к файлу (права или файл открыт другой программой)"),
+    ("No space left", "На диске нет места для временного файла"),
+]
+
 
 def ffmpeg_exe():
     import imageio_ffmpeg
@@ -43,11 +62,65 @@ def is_video(path):
     return os.path.splitext(path)[1].lower() in VIDEO_EXT
 
 
-def _run(args, timeout=None, on_progress=None, total_sec=None):
-    """Запустить ffmpeg, по желанию отдавая прогресс (0..1) из его stderr."""
+def check_readable(path, duration_sec=None, tmp_dir=None):
+    """Проверить файл перед обработкой и поднять понятную UserError, если что-то не так.
+    Без duration_sec проверяются только сам файл и облачные плейсхолдеры (для быстрой
+    проверки «до старта задачи», когда длительность ещё не известна); с duration_sec —
+    ещё и место на диске под временный WAV (нужно вызывать уже после probe_info)."""
+    if not os.path.exists(path):
+        raise UserError(f"Файл не найден: {os.path.basename(path)}. Возможно, он перемещён или переименован")
+    size = os.path.getsize(path)
+    if size == 0:
+        raise UserError("Файл пустой (0 байт)")
+    if sys.platform == "win32":
+        OFFLINE, RECALL_ON_DATA_ACCESS = 0x1000, 0x400000
+        attrs = getattr(os.stat(path), "st_file_attributes", 0)
+        if attrs & (OFFLINE | RECALL_ON_DATA_ACCESS):
+            raise UserError("Файл хранится только в облаке OneDrive. Откройте папку, "
+                             "выберите «Всегда сохранять на этом устройстве» и повторите")
+    elif sys.platform == "darwin":
+        d, name = os.path.split(path)
+        if os.path.exists(os.path.join(d, f".{name}.icloud")):
+            raise UserError("Файл ещё не скачан из iCloud")
+    if duration_sec:
+        need = duration_sec * 32000 * 1.2
+        free = shutil.disk_usage(tmp_dir or tempfile.gettempdir()).free
+        if free < need:
+            raise UserError(
+                f"На диске нет места для временного файла: нужно ~{need / 1e6:.0f} МБ, "
+                f"свободно {free / 1e6:.0f} МБ")
+
+
+def _watch_cancel(proc, cancel):
+    """Фоновый поток-наблюдатель: при взведённом cancel убивает процесс.
+    Нужен отдельно от основного цикла разбора stderr — чтение оттуда блокирующее,
+    и если ffmpeg надолго замолкает (например, между муксом дорожек), проверить
+    флаг в этом же потоке негде."""
+    killed = threading.Event()
+    if cancel is None:
+        return None, killed
+
+    def _watch():
+        while proc.poll() is None:
+            if cancel.wait(0.2):
+                killed.set()
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                return
+    t = threading.Thread(target=_watch, daemon=True)
+    t.start()
+    return t, killed
+
+
+def _run(args, timeout=None, on_progress=None, total_sec=None, cancel=None):
+    """Запустить ffmpeg, по желанию отдавая прогресс (0..1) из его stderr и позволяя
+    отменить через cancel (threading.Event)."""
     cmd = [ffmpeg_exe(), "-hide_banner", "-y"] + args
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                             text=True, encoding="utf-8", errors="replace", **_NO_WINDOW)
+    watcher, killed = _watch_cancel(proc, cancel)
     tail = []
     for line in proc.stderr:
         tail.append(line)
@@ -59,28 +132,48 @@ def _run(args, timeout=None, on_progress=None, total_sec=None):
                 cur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
                 on_progress(min(cur / total_sec, 1.0))
     proc.wait(timeout=timeout)
+    if watcher:
+        watcher.join(timeout=1.0)
+    if killed.is_set():
+        raise InterruptedError("отменено")
     if proc.returncode != 0:
+        text = "".join(tail)
+        for needle, human in FFMPEG_HINTS:
+            if needle in text:
+                raise UserError(human)
         raise RuntimeError("ffmpeg: " + "".join(tail[-8:]).strip())
 
 
-def probe_duration(path):
-    """Длительность в секундах через ffmpeg -i (ffprobe в imageio-ffmpeg нет)."""
+def probe_info(path):
+    """Длительность в секундах и число аудиодорожек через ffmpeg -i
+    (ffprobe в imageio-ffmpeg нет)."""
     proc = subprocess.run([ffmpeg_exe(), "-hide_banner", "-i", path], capture_output=True,
                           text=True, encoding="utf-8", errors="replace", **_NO_WINDOW)
-    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", proc.stderr or "")
-    if not m:
-        return None
-    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    err = proc.stderr or ""
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", err)
+    duration = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)) if m else None
+    audio_tracks = len(re.findall(r"Stream #\d+:\d+(?:\(\w+\))?:\s*Audio:", err))
+    return dict(duration=duration, audio_tracks=audio_tracks)
 
 
-def extract_wav(src, dst, on_progress=None):
-    """Любой медиафайл → 16 кГц моно WAV: именно это ест whisper."""
-    total = probe_duration(src)
-    _run(["-i", src, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", dst],
-         on_progress=on_progress, total_sec=total)
+def probe_duration(path):
+    """Длительность в секундах. Обёртка над probe_info для мест, которым не нужно
+    число дорожек (convert, cut_points)."""
+    return probe_info(path)["duration"]
+
+
+def extract_wav(src, dst, on_progress=None, cancel=None):
+    """Любой медиафайл → 16 кГц моно WAV: именно это ест whisper.
+    -map 0:a:0 — берём только первую аудиодорожку: без этого в файлах с несколькими
+    дорожками (например, из OBS) ffmpeg может сам выбрать не ту, а с явной картой
+    отсутствие звука даёт стабильную строку в stderr (см. FFMPEG_HINTS)."""
+    info = probe_info(src)
+    check_readable(src, duration_sec=info["duration"], tmp_dir=os.path.dirname(dst) or None)
+    _run(["-i", src, "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", dst],
+         on_progress=on_progress, total_sec=info["duration"], cancel=cancel)
     if on_progress:
         on_progress(1.0)  # длительность контейнера бывает больше звука — добиваем до 100%
-    return wav_duration(dst)
+    return wav_duration(dst), info["audio_tracks"]
 
 
 def wav_duration(path):
@@ -88,31 +181,43 @@ def wav_duration(path):
         return w.getnframes() / float(w.getframerate())
 
 
-def convert(src, dst, fmt, on_progress=None):
+def convert(src, dst, fmt, on_progress=None, cancel=None):
     """Конвертация по пресету. dst уже должен иметь нужное расширение."""
     if fmt not in CONVERT_PRESETS:
         raise ValueError(f"неизвестный формат: {fmt}")
     total = probe_duration(src)
-    _run(["-i", src] + CONVERT_PRESETS[fmt] + [dst], on_progress=on_progress, total_sec=total)
+    _run(["-i", src] + CONVERT_PRESETS[fmt] + [dst], on_progress=on_progress, total_sec=total, cancel=cancel)
 
 
-def extract_audio(src, dst, fmt="mp3", on_progress=None):
+def extract_audio(src, dst, fmt="mp3", on_progress=None, cancel=None):
     """Вытащить звуковую дорожку из видео. fmt: mp3 / wav / m4a / flac / ogg."""
-    convert(src, dst, fmt, on_progress)
+    convert(src, dst, fmt, on_progress, cancel)
 
 
-def silence_midpoints(path, noise_db="-30dB", min_sec="0.6"):
-    """Середины пауз, по возрастанию. Пусто при сбое — вызывающий режет по таймеру.
-    Перенесено из VK-Vibe unpack/transcribe.py."""
+def silence_midpoints(path, noise_db="-30dB", min_sec="0.6", cancel=None):
+    """Середины пауз, по возрастанию. Пусто при сбое запуска — вызывающий режет по
+    таймеру. Перенесено из VK-Vibe unpack/transcribe.py."""
+    cmd = [ffmpeg_exe(), "-hide_banner", "-nostats", "-i", path, "-af",
+           f"silencedetect=noise={noise_db}:d={min_sec}", "-f", "null", "-"]
     try:
-        proc = subprocess.run(
-            [ffmpeg_exe(), "-hide_banner", "-nostats", "-i", path, "-af",
-             f"silencedetect=noise={noise_db}:d={min_sec}", "-f", "null", "-"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=600, **_NO_WINDOW)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                text=True, encoding="utf-8", errors="replace", **_NO_WINDOW)
     except Exception:
         return []
-    log = proc.stderr or ""
+    watcher, killed = _watch_cancel(proc, cancel)
+    try:
+        _, err = proc.communicate(timeout=600)
+    except Exception:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        err = ""
+    if watcher:
+        watcher.join(timeout=1.0)
+    if killed.is_set():
+        raise InterruptedError("отменено")
+    log = err or ""
     starts = [float(x) for x in re.findall(r"silence_start:\s*([0-9.]+)", log)]
     ends = [float(x) for x in re.findall(r"silence_end:\s*([0-9.]+)", log)]
     return sorted((a + b) / 2 for a, b in zip(starts, ends))
