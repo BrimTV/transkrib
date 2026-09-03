@@ -248,7 +248,42 @@ class Api:
                        f"собрано окном={[n for n, _ in self._window_dnd_paths()]}")
         else:
             engine.log(f"dnd: {kind} paths={len(paths)}")
-        self._emit(dict(type="dropped", target=kind, paths=paths))
+        paths, skipped = self._expand_dropped(paths)
+        self._emit(dict(type="dropped", target=kind, paths=paths, skipped=skipped))
+
+    # Столько файлов берём из перетащенных папок за раз. Больше — это уже не
+    # «закинул записи», а случайно брошенный Рабочий стол: очередь из тысячи
+    # карточек человеку не поможет.
+    _DROP_LIMIT = 200
+
+    @classmethod
+    def _expand_dropped(cls, paths):
+        """Папку разворачиваем в лежащие внутри записи, а не отвечаем ошибкой:
+        люди перетаскивают папку целиком, это нормальный способ. Всё, что не
+        аудио и не видео, откладываем и сообщаем числом — молча проглатывать
+        нельзя, человек будет искать пропавший файл.
+
+        Возвращает (пути, сколько пропущено)."""
+        out, skipped = [], 0
+        for p in paths:
+            if os.path.isdir(p):
+                for root, dirs, names in os.walk(p):
+                    dirs.sort()
+                    # Служебные папки вроде .git или пакетов приложений внутрь не
+                    # разворачиваем: там нет записей, зато бывают тысячи файлов.
+                    dirs[:] = [d for d in dirs if not d.startswith(".") and "." not in d]
+                    for n in sorted(names):
+                        full = os.path.join(root, n)
+                        if media.is_media(full):
+                            out.append(full)
+                        if len(out) >= cls._DROP_LIMIT:
+                            engine.log(f"dnd: взято первых {cls._DROP_LIMIT} файлов из папки")
+                            return out, skipped
+            elif media.is_media(p):
+                out.append(p)
+            else:
+                skipped += 1
+        return out, skipped
 
     @staticmethod
     def _window_dnd_paths(consume=False):

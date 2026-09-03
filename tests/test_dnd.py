@@ -102,3 +102,36 @@ def test_в_мосте_нет_открытых_полей():
     a = Api()
     открытые = [n for n in dir(a) if not n.startswith("_") and not callable(getattr(a, n))]
     assert открытые == [], f"поля без подчёркивания в мосте: {открытые}"
+
+
+def test_папка_разворачивается_в_записи(tmp_path):
+    """Перетащить папку с записями — обычный способ, а не ошибка."""
+    (tmp_path / "запись1.mp3").write_bytes(b"x")
+    (tmp_path / "заметки.txt").write_bytes(b"x")
+    вложенная = tmp_path / "вчера"
+    вложенная.mkdir()
+    (вложенная / "запись2.wav").write_bytes(b"x")
+    (tmp_path / ".служебная").mkdir()
+    (tmp_path / ".служебная" / "запись3.mp3").write_bytes(b"x")
+
+    пути, пропущено = Api._expand_dropped([str(tmp_path)])
+    assert [p.rsplit("/", 1)[-1] for p in пути] == ["запись1.mp3", "запись2.wav"]
+    assert пропущено == 0, "файлы внутри папки не считаем пропущенными, их никто не выбирал"
+
+
+def test_не_медиа_файл_считается_пропущенным(tmp_path):
+    док = tmp_path / "договор.pdf"
+    док.write_bytes(b"x")
+    звук = tmp_path / "речь.m4a"
+    звук.write_bytes(b"x")
+    пути, пропущено = Api._expand_dropped([str(док), str(звук)])
+    assert пути == [str(звук)]
+    assert пропущено == 1
+
+
+def test_из_папки_берётся_не_больше_предела(tmp_path, monkeypatch):
+    monkeypatch.setattr(Api, "_DROP_LIMIT", 3)
+    for i in range(10):
+        (tmp_path / f"{i}.mp3").write_bytes(b"x")
+    пути, _ = Api._expand_dropped([str(tmp_path)])
+    assert len(пути) == 3

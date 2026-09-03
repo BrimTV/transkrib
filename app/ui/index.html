@@ -296,8 +296,18 @@ document.addEventListener('drop', e => e.preventDefault());
 wireDrop($('#dropTr'), addToQueue);
 wireDrop($('#dropCv'), addToConvert);
 function onDropped(e) {
-  if (e.paths && e.paths.length) (e.target === 'convert' ? addToConvert : addToQueue)(e.paths);
-  else toast('Не удалось получить путь к файлу — нажмите на область и выберите файл');
+  // Пропущенное считает Python: он один видит, что лежит в перетащенной папке.
+  // Молчать про это нельзя — человек будет искать файл, которого нет в очереди.
+  const skipped = e.skipped || 0;
+  if (e.paths && e.paths.length) {
+    (e.target === 'convert' ? addToConvert : addToQueue)(e.paths);
+    if (skipped) toast(skipped === 1 ? 'Один файл пропущен: это не аудио и не видео'
+                                     : `Пропущено файлов: ${skipped} — это не аудио и не видео`);
+  } else if (skipped) {
+    toast('Среди перетащенного нет аудио и видео');
+  } else {
+    toast('Не удалось получить путь к файлу — нажмите на область и выберите файл');
+  }
 }
 
 // ── очередь расшифровки ──────────────────────────────────────────────────
