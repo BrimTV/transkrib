@@ -136,3 +136,16 @@ def test_из_папки_берётся_не_больше_предела(tmp_pat
         (tmp_path / f"{i}.mp3").write_bytes(b"x")
     пути, _ = Api._expand_dropped([str(tmp_path)])
     assert len(пути) == 3
+
+
+def test_папка_с_точкой_в_имени_не_считается_служебной(tmp_path):
+    """«эфир 12.05» — обычное название папки, а не пакет приложения."""
+    внутри = tmp_path / "эфир 12.05"
+    внутри.mkdir()
+    (внутри / "часть1.mp3").write_bytes(b"x")
+    пакет = tmp_path / "Монтаж.fcpbundle"
+    пакет.mkdir()
+    (пакет / "спрятано.mp3").write_bytes(b"x")
+
+    пути, _ = Api._expand_dropped([str(tmp_path)])
+    assert [os.path.basename(p) for p in пути] == ["часть1.mp3"]

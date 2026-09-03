@@ -255,6 +255,10 @@ class Api:
     # «закинул записи», а случайно брошенный Рабочий стол: очередь из тысячи
     # карточек человеку не поможет.
     _DROP_LIMIT = 200
+    # Папки, которые macOS показывает одним объектом: внутрь лезть незачем.
+    _BUNDLE_DIR_EXT = frozenset({".app", ".bundle", ".framework", ".photoslibrary",
+                                ".fcpbundle", ".imovielibrary", ".tvlibrary",
+                                ".logicx", ".band", ".sparsebundle", ".rtfd"})
 
     @classmethod
     def _expand_dropped(cls, paths):
@@ -269,9 +273,12 @@ class Api:
             if os.path.isdir(p):
                 for root, dirs, names in os.walk(p):
                     dirs.sort()
-                    # Служебные папки вроде .git или пакетов приложений внутрь не
-                    # разворачиваем: там нет записей, зато бывают тысячи файлов.
-                    dirs[:] = [d for d in dirs if not d.startswith(".") and "." not in d]
+                    # Скрытые папки и пакеты (.app, фотобиблиотека, проект
+                    # монтажа) внутрь не разворачиваем: записей там нет, зато
+                    # бывают десятки тысяч файлов. Точка в имени сама по себе
+                    # ничего не значит — «эфир 12.05» это обычная папка.
+                    dirs[:] = [d for d in dirs if not d.startswith(".")
+                               and os.path.splitext(d)[1].lower() not in cls._BUNDLE_DIR_EXT]
                     for n in sorted(names):
                         full = os.path.join(root, n)
                         if media.is_media(full):
