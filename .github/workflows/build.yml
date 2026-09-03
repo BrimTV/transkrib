@@ -130,8 +130,25 @@ jobs:
         run: |
           Copy-Item build\README-windows.txt dist\ЧИТАЙ.txt
           $zip = "Transkrib-${{ matrix.variant }}-windows.zip"
-          7z a -tzip -mx=3 -mcu=on $zip .\dist\Transkrib .\dist\ЧИТАЙ.txt | Out-Null
-          Get-Item $zip | Select-Object Name, @{n="MB";e={[math]::Round($_.Length/1MB)}}
+          # Библиотеки NVIDIA — отдельным дополнением: вместе с ними сборка medium
+          # весит 2.9 ГБ, а GitHub не принимает в релиз файл больше двух гигабайт,
+          # и основная сборка просто не доехала бы до людей. Без видеокарты они
+          # не нужны вовсе, а с видеокартой распаковываются поверх той же папки.
+          Push-Location dist
+          7z a -tzip -mx=3 -mcu=on ..\$zip Transkrib ЧИТАЙ.txt "-xr!nvidia" | Out-Null
+          if (Test-Path Transkrib\_internal\nvidia) {
+            Copy-Item ..\build\README-windows-nvidia.txt "ЧИТАЙ-ВИДЕОКАРТА.txt"
+            $nv = "Transkrib-${{ matrix.variant }}-windows-nvidia.zip"
+            7z a -tzip -mx=5 -mcu=on ..\$nv Transkrib\_internal\nvidia "ЧИТАЙ-ВИДЕОКАРТА.txt" | Out-Null
+            echo "NVIDIA_ZIP=$nv" >> $env:GITHUB_ENV
+          }
+          Pop-Location
+          Get-Item Transkrib-*.zip | Select-Object Name, @{n="MB";e={[math]::Round($_.Length/1MB)}}
+          # Предел GitHub — 2 ГиБ на файл. Ловим здесь, а не на выкладке релиза:
+          # там это молчаливое предупреждение и релиз без нужного архива.
+          foreach ($f in Get-Item Transkrib-*.zip) {
+            if ($f.Length -ge 2147483648) { throw "$($f.Name) больше 2 ГиБ — в релиз не примут" }
+          }
           echo "ZIP_NAME=$zip" >> $env:GITHUB_ENV
 
       - name: Package (macOS)
@@ -177,6 +194,24 @@ jobs:
           if (-not (Test-Path "archive_check\Transkrib\Transkrib.exe")) { throw "Transkrib\Transkrib.exe отсутствует в архиве" }
           Write-Host "OK: ЧИТАЙ.txt и Transkrib\Transkrib.exe на месте"
           Remove-Item -Recurse -Force archive_check
+
+      - name: Дополнение NVIDIA раскладывается поверх программы (medium, Windows)
+        if: runner.os == 'Windows' && matrix.variant == 'medium'
+        shell: pwsh
+        run: |
+          # Дополнение обязано лечь ровно поверх распакованной программы: иначе
+          # человек «поставит» его и не поймёт, почему видеокарта не появилась.
+          Remove-Item -Recurse -Force addon_check -ErrorAction SilentlyContinue
+          7z x $env:ZIP_NAME -oaddon_check -y | Out-Null
+          if (Test-Path "addon_check\Transkrib\_internal\nvidia") { throw "библиотеки NVIDIA попали в основной архив" }
+          7z x $env:NVIDIA_ZIP -oaddon_check -y | Out-Null
+          foreach ($dll in @("cublas64_12.dll", "cublasLt64_12.dll", "cudnn64_9.dll")) {
+            if (-not (Get-ChildItem -Recurse "addon_check\Transkrib\_internal\nvidia" -Filter $dll)) {
+              throw "после распаковки дополнения нет $dll"
+            }
+          }
+          if (-not (Test-Path "addon_check\ЧИТАЙ-ВИДЕОКАРТА.txt")) { throw "в дополнении нет инструкции" }
+          Write-Host "OK: дополнение легло поверх программы"
 
       - name: Манифест содержит activeCodePage (Windows)
         if: runner.os == 'Windows'
@@ -350,7 +385,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: Transkrib-${{ matrix.variant }}-${{ matrix.name }}
-          path: ${{ env.ZIP_NAME }}
+          path: |
+            ${{ env.ZIP_NAME }}
+            ${{ env.NVIDIA_ZIP }}
           compression-level: 0
 
   release:
@@ -371,7 +408,10 @@ jobs:
       - name: Все четыре архива на месте
         run: |
           ls -la out/
-          test "$(ls out/*.zip | wc -l)" -eq 4 || { echo "ожидалось 4 архива"; exit 1; }
+          test "$(ls out/*.zip | wc -l)" -eq 5 || { echo "ожидалось 5 архивов: четыре сборки и дополнение NVIDIA"; exit 1; }
+          for f in out/*.zip; do
+            test "$(stat -c%s "$f")" -lt 2147483648 || { echo "$f больше 2 ГиБ — в релиз не примут"; exit 1; }
+          done
       - uses: softprops/action-gh-release@v2
         with:
           files: out/*.zip

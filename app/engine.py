@@ -392,6 +392,15 @@ def _cuda_diag():
         info["driver_msg"] = f"ошибка проверки драйвера: {e}"
 
     info["nvidia_smi"] = _nvidia_smi()
+
+    # Библиотеки для видеокарты едут отдельным дополнением (вместе с ними сборка
+    # не влезает в предел размера файла у GitHub). Владелец видеокарты, который
+    # его не поставил, иначе просто увидит «процессор» и не поймёт почему —
+    # поэтому отличаем «дополнения нет» от «драйвер старый» и от «карты нет».
+    if not dll_dirs and info.get("driver_version"):
+        info["addon_msg"] = ("У вас есть видеокарта NVIDIA, но дополнение для неё не "
+                             "установлено. Скачайте Transkrib-medium-windows-nvidia.zip "
+                             "и распакуйте в папку с программой")
     return info
 
 
@@ -888,6 +897,11 @@ def transcribe_file(src, model_key, language, emit, cancel=None, prefer_gpu=True
         _emit(e)
     with _prevent_sleep():
         try:
+            # Владельцу видеокарты, не поставившему дополнение, надо сказать об этом
+            # словами, а не оставлять его гадать, почему считает процессор.
+            hint = (hardware_info().get("cuda_diag") or {}).get("addon_msg")
+            if hint and prefer_gpu:
+                emit(dict(type="stage", stage="hardware", note=True, msg=hint))
             media.check_readable(src)  # быстрая проверка до старта: файл есть, не пуст, не облачный плейсхолдер
             emit(dict(type="stage", stage="extract", msg="Извлекаю звуковую дорожку"))
             total_sec, audio_tracks = media.extract_wav(
