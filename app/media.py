@@ -145,10 +145,13 @@ def _run(args, timeout=None, on_progress=None, total_sec=None, cancel=None):
 
 
 def probe_info(path):
-    """Длительность в секундах, число аудиодорожек и частота дискретизации
-    первой дорожки через ffmpeg -i (ffprobe в imageio-ffmpeg нет).
+    """Длительность в секундах, число аудиодорожек, частота дискретизации и число
+    каналов первой дорожки через ffmpeg -i (ffprobe в imageio-ffmpeg нет).
     sample_rate — только для диагностики (Б6): 8 кГц телефония ничего не
-    меняет в поведении, но полезна в логе при жалобах на качество."""
+    меняет в поведении, но полезна в логе при жалобах на качество.
+    channels — для В6 (звонки по каналам): None, если распознать не удалось
+    (непривычная раскладка вроде 5.1) — это безопасный дефолт: «не знаем,
+    не пробуем канальный способ», а не «считаем, что канал один»."""
     proc = subprocess.run([ffmpeg_exe(), "-hide_banner", "-i", path], capture_output=True,
                           text=True, encoding="utf-8", errors="replace", **_NO_WINDOW)
     err = proc.stderr or ""
@@ -157,7 +160,22 @@ def probe_info(path):
     audio_tracks = len(re.findall(r"Stream #\d+:\d+(?:\(\w+\))?:\s*Audio:", err))
     sr_m = re.search(r"Audio:[^\n]*?(\d+)\s*Hz", err)
     sample_rate = int(sr_m.group(1)) if sr_m else None
-    return dict(duration=duration, audio_tracks=audio_tracks, sample_rate=sample_rate)
+    channels = None
+    au_line_m = re.search(r"Audio:[^\n]*", err)
+    if au_line_m:
+        # Раскладка каналов — отдельное поле в перечислении через запятую после
+        # частоты (", stereo,", ", mono,", ", 2 channels," — формат ffmpeg,
+        # не наш выбор). Незнакомые раскладки (5.1 и т.п.) осознанно не разбираем.
+        for part in (p.strip() for p in au_line_m.group(0).split(",")):
+            if part == "mono":
+                channels = 1
+            elif part == "stereo":
+                channels = 2
+            else:
+                n_m = re.match(r"^(\d+)\s*channels?$", part)
+                if n_m:
+                    channels = int(n_m.group(1))
+    return dict(duration=duration, audio_tracks=audio_tracks, sample_rate=sample_rate, channels=channels)
 
 
 def probe_duration(path):
@@ -336,6 +354,118 @@ def speech_regions(wav, total_sec, on_progress=None, cancel=None, block=600.0):
         else:
             merged.append((a, b))
     return merged
+
+
+def _mask_to_turns(active, win_sec, speaker, min_gap=0.5, min_dur=0.5):
+    """Маска активности по окнам → реплики одного говорящего. Сначала окна
+    подряд собираются в интервалы, затем короткие паузы внутри реплики (короче
+    min_gap — заминка, вдох, а не переход хода) склеиваются, а то, что всё
+    равно осталось короче min_dur, выбрасывается как щелчок или наводка."""
+    segments = []
+    start = None
+    for i, a in enumerate(active):
+        if a and start is None:
+            start = i
+        elif not a and start is not None:
+            segments.append((start * win_sec, i * win_sec))
+            start = None
+    if start is not None:
+        segments.append((start * win_sec, len(active) * win_sec))
+
+    merged = []
+    for s, e in segments:
+        if merged and s - merged[-1][1] < min_gap:
+            merged[-1] = (merged[-1][0], e)
+        else:
+            merged.append((s, e))
+
+    return [dict(start=round(s, 2), end=round(e, 2), speaker=speaker)
+            for s, e in merged if e - s >= min_dur]
+
+
+def stereo_turns(src, total_sec, cancel=None):
+    """Записи Zoom, Telegram и телефонных приложений часто держат собеседников
+    в разных каналах стерео — тогда разделять голоса через sherpa-onnx не
+    нужно и вредно (медленнее и ошибается там, где канал уже сказал, кто есть
+    кто). Проверяем это по огибающей громкости левого и правого канала и, если
+    похоже на такую запись, строим turns того же вида, что диаризация
+    (app.diarize._finalize), без вызова sherpa. Говорящие нумеруются с 1, как
+    у диаризации, — UI и экспорт не отличают один способ от другого.
+
+    Возвращает None, если способ не подходит (моно, обычная стереозапись с
+    одним микрофоном, тишина) — тогда вызывающая сторона идёт обычным путём
+    через sherpa. Любая осечка (ffmpeg не смог, файл не вскрылся) — тоже None,
+    а не исключение: это эвристика для ускорения, а не обязательный шаг."""
+    try:
+        info = probe_info(src)
+        if info["channels"] != 2:
+            return None
+
+        from . import engine  # лениво — engine.py на верхнем уровне импортирует этот модуль
+        tmp_dir = tempfile.mkdtemp(prefix="transkrib_stereo_", dir=engine.temp_dir())
+        try:
+            wav = os.path.join(tmp_dir, "stereo.wav")
+            # -ac 2, а не 1: extract_wav рядом даёт моно специально для whisper,
+            # а здесь каналы — это и есть сигнал, их нельзя склеивать.
+            _run(["-i", src, "-map", "0:a:0", "-vn", "-ac", "2", "-ar", "16000",
+                  "-c:a", "pcm_s16le", wav], total_sec=total_sec, cancel=cancel)
+
+            import numpy as np
+            with wave.open(wav, "rb") as w:
+                sr = w.getframerate()
+                if w.getnchannels() != 2:
+                    return None
+                win = int(sr * 0.1)  # окна по 100 мс
+                if win <= 0:
+                    return None
+                # Читаем кусками, а не целиком: двухчасовой звонок — это четверть
+                # миллиарда отсчётов, и один разворот в float съел бы больше памяти,
+                # чем сама модель распознавания. Кусок кратен окну, чтобы окна не
+                # разъезжались по границе.
+                block = win * 600  # ~минута
+                rms_parts = []
+                while True:
+                    raw = w.readframes(block)
+                    if not raw:
+                        break
+                    part = np.frombuffer(raw, dtype=np.int16).reshape(-1, 2)
+                    n = len(part) // win
+                    if n == 0:
+                        break
+                    part = part[:n * win].reshape(n, win, 2).astype(np.float32) / 32768.0
+                    rms_parts.append(np.sqrt(np.mean(part * part, axis=1)))
+            if not rms_parts:
+                return None
+            rms = np.concatenate(rms_parts)  # (n_win, 2)
+            n_win = len(rms)
+            if n_win == 0:
+                return None
+            with np.errstate(divide="ignore"):
+                db = 20 * np.log10(np.maximum(rms, 1e-9))  # относительно полной шкалы int16
+            active = db > -40.0  # (n_win, 2) — активен ли канал в этом окне
+            l_active, r_active = active[:, 0], active[:, 1]
+
+            both = int(np.sum(l_active & r_active))
+            either = int(np.sum(l_active | r_active))
+            if either == 0:
+                return None
+            exclusivity = 1.0 - both / either
+            if exclusivity <= 0.7:
+                return None  # оба канала звучат вместе — обычная стереозапись, не звонок
+            if l_active.sum() < 0.05 * n_win or r_active.sum() < 0.05 * n_win:
+                return None  # один из каналов почти всегда молчит — не похоже на диалог
+
+            turns = _mask_to_turns(l_active, win / sr, speaker=1) + \
+                _mask_to_turns(r_active, win / sr, speaker=2)
+            turns.sort(key=lambda t: t["start"])
+            return turns or None
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+    except InterruptedError:
+        raise
+    except Exception as e:
+        _log(f"stereo_turns: способ по каналам не подошёл ({e})")
+        return None
 
 
 def region_gaps(regions, min_gap=0.6):

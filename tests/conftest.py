@@ -119,6 +119,16 @@ def stereo_call_wav(tmp_path_factory, speech_ru_10s):
 
 
 @pytest.fixture(scope="session")
+def stereo_same_wav(tmp_path_factory, speech_ru_10s):
+    """Та же речь одинаково в обоих каналах — обычная стереозапись одним микрофоном,
+    не звонок с раздельными каналами. На ней media.stereo_turns обязан отказаться
+    (взаимоисключаемость каналов около нуля — они звучат одновременно)."""
+    path = tmp_path_factory.mktemp("fixtures") / "stereo_same.wav"
+    _ffmpeg("-i", str(speech_ru_10s), "-af", "pan=stereo|c0=c0|c1=c0", str(path))
+    return path
+
+
+@pytest.fixture(scope="session")
 def multitrack_mkv(tmp_path_factory):
     """Видео с двумя независимыми аудиодорожками (как в записях OBS)."""
     path = tmp_path_factory.mktemp("fixtures") / "multitrack.mkv"

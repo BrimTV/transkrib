@@ -967,30 +967,46 @@ def transcribe_file(src, model_key, language, emit, cancel=None, prefer_gpu=True
                     backend = "cpu"
                     compute_type = None
             if diarize and not cancel.is_set():
-                # После текста, а не параллельно: на 8 ГБ два движка разом выбивали MLX
-                # в CPU-фолбэк (Metal не мог выделить память), а на длинных файлах
-                # диаризация ещё и тяжёлая сама по себе.
-                from . import diarize as _diar
-                avail = memory_available_gb()
-                long_file = total_sec > 3600  # дольше часа — выгружаем всегда, не дожидаясь нехватки памяти
-                if long_file or (avail is not None and avail < 2.5):
-                    unload_models()
-                    log("unload before diarization: " +
-                        ("запись длиннее часа" if long_file else f"{avail:.1f} GB free"))
-                # 0.05× длительности — сложившаяся на практике оценка при шаге окна 0.5 (см. diarize.py)
-                eta = _fmt_dur(total_sec * 0.05)
-                emit(dict(type="stage", stage="diarize", msg=f"Текст готов, определяю говорящих (≈{eta})"))
-                try:
-                    turns = _diar.run_in_worker(wav, emit, num_speakers, cancel)
+                # Стерео-звонки (В6): в записях Zoom, Telegram и телефонных приложений
+                # собеседники часто физически разложены по разным каналам стерео — тогда
+                # угадывать голоса через sherpa не нужно и вредно (медленнее и ошибается
+                # там, где канал уже однозначно говорит, кто есть кто). Пробуем этот
+                # способ первым, до sherpa; не подошёл (моно, обычная стереозапись с одним
+                # микрофоном) — media.stereo_turns сама вернёт None, идём обычным путём.
+                # Если человек прямо указал число голосов и оно не два, канальный
+                # способ заведомо не то, что просили: в каналах их всегда двое.
+                turns = None if num_speakers not in (0, 2) else media.stereo_turns(src, total_sec, cancel)
+                if turns is not None:
                     n = len({t["speaker"] for t in turns})
-                    emit(dict(type="speakers", turns=turns, count=n))
-                except InterruptedError:
-                    raise
-                except Exception as e:
-                    import traceback
-                    log("diarization FAILED:\n" + traceback.format_exc())
+                    log(f"стерео-звонок: говорящие разложены по каналам ({n}), sherpa не вызываю")
                     emit(dict(type="stage", stage="diarize", note=True,
-                              msg=f"Разделить по говорящим не удалось: {str(e)[:120]}"))
+                              msg="Собеседники записаны в разные каналы — разделил по ним, это точнее и быстрее"))
+                    emit(dict(type="speakers", turns=turns, count=n))
+                else:
+                    # После текста, а не параллельно: на 8 ГБ два движка разом выбивали MLX
+                    # в CPU-фолбэк (Metal не мог выделить память), а на длинных файлах
+                    # диаризация ещё и тяжёлая сама по себе.
+                    from . import diarize as _diar
+                    avail = memory_available_gb()
+                    long_file = total_sec > 3600  # дольше часа — выгружаем всегда, не дожидаясь нехватки памяти
+                    if long_file or (avail is not None and avail < 2.5):
+                        unload_models()
+                        log("unload before diarization: " +
+                            ("запись длиннее часа" if long_file else f"{avail:.1f} GB free"))
+                    # 0.05× длительности — сложившаяся на практике оценка при шаге окна 0.5 (см. diarize.py)
+                    eta = _fmt_dur(total_sec * 0.05)
+                    emit(dict(type="stage", stage="diarize", msg=f"Текст готов, определяю говорящих (≈{eta})"))
+                    try:
+                        turns = _diar.run_in_worker(wav, emit, num_speakers, cancel)
+                        n = len({t["speaker"] for t in turns})
+                        emit(dict(type="speakers", turns=turns, count=n))
+                    except InterruptedError:
+                        raise
+                    except Exception as e:
+                        import traceback
+                        log("diarization FAILED:\n" + traceback.format_exc())
+                        emit(dict(type="stage", stage="diarize", note=True,
+                                  msg=f"Разделить по говорящим не удалось: {str(e)[:120]}"))
             elapsed = time.time() - t_start
             emit(dict(type="done", backend=backend, elapsed=elapsed, total_sec=total_sec,
                       msg=f"Готово за {_fmt_dur(elapsed)} (скорость {total_sec / max(elapsed, 0.01):.1f}x)"))
