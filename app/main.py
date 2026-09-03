@@ -191,7 +191,13 @@ def _autosave_to_dir(dest_dir, base, formats, render, idx):
 
 class Api:
     def __init__(self):
-        self.window = None
+        # Имя с подчёркиванием обязательно. Перед открытием окна pywebview
+        # рекурсивно обходит этот объект, собирая методы для JS, и пропускает
+        # только имена с подчёркивания (webview/util.py: get_functions). Пока
+        # окно лежало здесь под открытым именем, обход уходил внутрь него: на
+        # macOS это лишняя работа, а на Windows — тысячи ошибок COM и упор в
+        # предел рекурсии, после которого приложение не закрывалось вовсе.
+        self._window = None
         self._cancel = None
         self._busy = False
         self._thread = None
@@ -210,7 +216,7 @@ class Api:
             event["job"] = job_id
         payload = json.dumps(event, ensure_ascii=False)
         try:
-            self.window.evaluate_js(f"window.onEngineEvent({payload})")
+            self._window.evaluate_js(f"window.onEngineEvent({payload})")
         except Exception:
             pass
 
@@ -222,7 +228,7 @@ class Api:
         имя). get_element дёргает evaluate_js, поэтому элементы должны уже быть
         в DOM — подписываемся из window.events.loaded, не раньше."""
         for sel, kind in (("#dropTr", "transcribe"), ("#dropCv", "convert")):
-            el = self.window.dom.get_element(sel)
+            el = self._window.dom.get_element(sel)
             if el:
                 el.events.drop += functools.partial(self._on_drop, kind)
 
@@ -330,7 +336,7 @@ class Api:
         last_dir = s.get("pick_dir") or ""
         if not (last_dir and os.path.isdir(last_dir)):
             last_dir = os.path.expanduser("~")
-        res = self.window.create_file_dialog(webview.OPEN_DIALOG, directory=last_dir,
+        res = self._window.create_file_dialog(webview.OPEN_DIALOG, directory=last_dir,
                                              allow_multiple=True, file_types=types)
         paths = [p for p in (res or []) if os.path.isfile(p)]
         if paths:
@@ -483,7 +489,7 @@ class Api:
 
     def save_as(self, segments, fmt, suggested):
         import webview
-        res = self.window.create_file_dialog(webview.SAVE_DIALOG, save_filename=f"{suggested}.{fmt}")
+        res = self._window.create_file_dialog(webview.SAVE_DIALOG, save_filename=f"{suggested}.{fmt}")
         if not res:
             return None
         out = res[0] if isinstance(res, (list, tuple)) else res
@@ -674,7 +680,7 @@ def _run_smoke(argv):
 
     window = webview.create_window(f"Transkrib {__version__}", _ui_path(), js_api=api,
                                    width=1100, height=740, background_color="#111418")
-    api.window = window
+    api._window = window
     window.events.loaded += api._wire_dnd
     window.events.loaded += on_loaded
 
@@ -778,7 +784,7 @@ def main():
     window = webview.create_window(f"Transkrib {__version__}", _ui_path(), js_api=api,
                                    width=1100, height=740, min_size=(820, 560),
                                    background_color="#111418")
-    api.window = window
+    api._window = window
     window.events.loaded += api._wire_dnd
     api.start_housekeeping()
     webview.start(private_mode=False, storage_path=_webview_storage_path(), debug="--debug" in sys.argv)
