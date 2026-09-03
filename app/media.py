@@ -383,12 +383,110 @@ def _mask_to_turns(active, win_sec, speaker, min_gap=0.5, min_dur=0.5):
             for s, e in merged if e - s >= min_dur]
 
 
+# Порог взаимоисключаемости каналов: выше — собеседники звучат по очереди, то есть
+# сидят в разных каналах; ниже — обычная стереозапись, где оба канала звучат вместе.
+_STEREO_EXCLUSIVITY = 0.7
+# Пробная выборка: решать «звонок по каналам или обычная запись» по всему файлу
+# незачем — это лишнее полное декодирование на каждом файле, который окажется
+# обычным стерео. Слушаем три куска по минуте, разнесённые по записи: только по
+# началу судить нельзя, второй собеседник может вступить и через полчаса.
+_STEREO_PROBE_SEC = 60.0
+_STEREO_PROBE_AT = (0.05, 0.45, 0.8)
+
+
+def _channel_envelopes(src, total_sec, cancel=None, limit_sec=None, seek=None):
+    """Маски «канал звучит» по окнам 100 мс для левого и правого канала.
+    Возвращает (левая, правая, длина окна в секундах) или None."""
+    import numpy as np
+    from . import engine  # лениво — engine.py на верхнем уровне импортирует этот модуль
+
+    tmp_dir = tempfile.mkdtemp(prefix="transkrib_stereo_", dir=engine.temp_dir())
+    try:
+        wav = os.path.join(tmp_dir, "stereo.wav")
+        # -ac 2, а не 1: extract_wav рядом даёт моно специально для whisper, а здесь
+        # каналы — это и есть сигнал, их нельзя склеивать. 8 кГц хватает: нужна
+        # только громкость по окнам, слова отсюда никто не читает.
+        args = ["-i", src, "-map", "0:a:0", "-vn", "-ac", "2", "-ar", "8000", "-c:a", "pcm_s16le"]
+        if limit_sec:
+            args = ["-t", str(limit_sec)] + args
+        if seek:
+            args = ["-ss", str(seek)] + args
+        _run(args + [wav], total_sec=min(total_sec or 0, limit_sec or total_sec or 0) or None,
+             cancel=cancel)
+
+        with wave.open(wav, "rb") as w:
+            sr = w.getframerate()
+            if w.getnchannels() != 2:
+                return None
+            win = int(sr * 0.1)  # окна по 100 мс
+            if win <= 0:
+                return None
+            # Читаем кусками, а не целиком: двухчасовой звонок — это десятки
+            # миллионов отсчётов, и разворот в float стоил бы больше памяти,
+            # чем сама модель. Кусок кратен окну, чтобы окна не разъезжались.
+            rms_parts = []
+            while True:
+                raw = w.readframes(win * 600)
+                if not raw:
+                    break
+                part = np.frombuffer(raw, dtype=np.int16).reshape(-1, 2)
+                n = len(part) // win
+                if n == 0:
+                    break
+                part = part[:n * win].reshape(n, win, 2).astype(np.float32) / 32768.0
+                rms_parts.append(np.sqrt(np.mean(part * part, axis=1)))
+        if not rms_parts:
+            return None
+        rms = np.concatenate(rms_parts)  # (окон, 2)
+        with np.errstate(divide="ignore"):
+            db = 20 * np.log10(np.maximum(rms, 1e-9))  # относительно полной шкалы int16
+        active = db > -40.0
+        return active[:, 0], active[:, 1], win / sr
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _looks_like_two_channel_call(left, right):
+    """Каналы звучат по очереди и в обоих есть речь — похоже на звонок, где
+    собеседники физически разложены по каналам."""
+    import numpy as np
+    n = len(left)
+    both = int(np.sum(left & right))
+    either = int(np.sum(left | right))
+    if either == 0 or n == 0:
+        return False
+    if 1.0 - both / either <= _STEREO_EXCLUSIVITY:
+        return False  # оба канала звучат вместе — обычная стереозапись, не звонок
+    return left.sum() >= 0.05 * n and right.sum() >= 0.05 * n
+
+
+def _probe_looks_like_call(src, total_sec, cancel=None):
+    """Дешёвая проба на длинной записи: слушаем несколько кусков в разных местах
+    и складываем их маски. Куски разнесены нарочно — если слушать только начало,
+    собеседник, вступивший позже, не попадёт в пробу, и настоящий звонок уйдёт
+    на долгий разбор голосами."""
+    import numpy as np
+    lefts, rights = [], []
+    for at in _STEREO_PROBE_AT:
+        seek = total_sec * at
+        if seek + 1.0 >= total_sec:
+            continue
+        env = _channel_envelopes(src, total_sec, cancel,
+                                 limit_sec=_STEREO_PROBE_SEC, seek=seek)
+        if env is not None:
+            lefts.append(env[0])
+            rights.append(env[1])
+    if not lefts:
+        return True  # проба не удалась — не отказываем, решит полный разбор
+    return _looks_like_two_channel_call(np.concatenate(lefts), np.concatenate(rights))
+
+
 def stereo_turns(src, total_sec, cancel=None):
     """Записи Zoom, Telegram и телефонных приложений часто держат собеседников
     в разных каналах стерео — тогда разделять голоса через sherpa-onnx не
     нужно и вредно (медленнее и ошибается там, где канал уже сказал, кто есть
-    кто). Проверяем это по огибающей громкости левого и правого канала и, если
-    похоже на такую запись, строим turns того же вида, что диаризация
+    кто). Смотрим на громкость левого и правого канала по окнам и, если они
+    звучат по очереди, строим turns того же вида, что диаризация
     (app.diarize._finalize), без вызова sherpa. Говорящие нумеруются с 1, как
     у диаризации, — UI и экспорт не отличают один способ от другого.
 
@@ -397,70 +495,22 @@ def stereo_turns(src, total_sec, cancel=None):
     через sherpa. Любая осечка (ffmpeg не смог, файл не вскрылся) — тоже None,
     а не исключение: это эвристика для ускорения, а не обязательный шаг."""
     try:
-        info = probe_info(src)
-        if info["channels"] != 2:
+        if probe_info(src)["channels"] != 2:
             return None
 
-        from . import engine  # лениво — engine.py на верхнем уровне импортирует этот модуль
-        tmp_dir = tempfile.mkdtemp(prefix="transkrib_stereo_", dir=engine.temp_dir())
-        try:
-            wav = os.path.join(tmp_dir, "stereo.wav")
-            # -ac 2, а не 1: extract_wav рядом даёт моно специально для whisper,
-            # а здесь каналы — это и есть сигнал, их нельзя склеивать.
-            _run(["-i", src, "-map", "0:a:0", "-vn", "-ac", "2", "-ar", "16000",
-                  "-c:a", "pcm_s16le", wav], total_sec=total_sec, cancel=cancel)
-
-            import numpy as np
-            with wave.open(wav, "rb") as w:
-                sr = w.getframerate()
-                if w.getnchannels() != 2:
-                    return None
-                win = int(sr * 0.1)  # окна по 100 мс
-                if win <= 0:
-                    return None
-                # Читаем кусками, а не целиком: двухчасовой звонок — это четверть
-                # миллиарда отсчётов, и один разворот в float съел бы больше памяти,
-                # чем сама модель распознавания. Кусок кратен окну, чтобы окна не
-                # разъезжались по границе.
-                block = win * 600  # ~минута
-                rms_parts = []
-                while True:
-                    raw = w.readframes(block)
-                    if not raw:
-                        break
-                    part = np.frombuffer(raw, dtype=np.int16).reshape(-1, 2)
-                    n = len(part) // win
-                    if n == 0:
-                        break
-                    part = part[:n * win].reshape(n, win, 2).astype(np.float32) / 32768.0
-                    rms_parts.append(np.sqrt(np.mean(part * part, axis=1)))
-            if not rms_parts:
+        # Сначала проба: если это обычная стереозапись (а так будет с большинством
+        # файлов), отказ обходится в секунды и полного декодирования не случается.
+        if total_sec and total_sec > _STEREO_PROBE_SEC * len(_STEREO_PROBE_AT) * 1.2:
+            if not _probe_looks_like_call(src, total_sec, cancel):
                 return None
-            rms = np.concatenate(rms_parts)  # (n_win, 2)
-            n_win = len(rms)
-            if n_win == 0:
-                return None
-            with np.errstate(divide="ignore"):
-                db = 20 * np.log10(np.maximum(rms, 1e-9))  # относительно полной шкалы int16
-            active = db > -40.0  # (n_win, 2) — активен ли канал в этом окне
-            l_active, r_active = active[:, 0], active[:, 1]
 
-            both = int(np.sum(l_active & r_active))
-            either = int(np.sum(l_active | r_active))
-            if either == 0:
-                return None
-            exclusivity = 1.0 - both / either
-            if exclusivity <= 0.7:
-                return None  # оба канала звучат вместе — обычная стереозапись, не звонок
-            if l_active.sum() < 0.05 * n_win or r_active.sum() < 0.05 * n_win:
-                return None  # один из каналов почти всегда молчит — не похоже на диалог
-
-            turns = _mask_to_turns(l_active, win / sr, speaker=1) + \
-                _mask_to_turns(r_active, win / sr, speaker=2)
-            turns.sort(key=lambda t: t["start"])
-            return turns or None
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+        env = _channel_envelopes(src, total_sec, cancel)
+        if env is None or not _looks_like_two_channel_call(env[0], env[1]):
+            return None
+        left, right, win_sec = env
+        turns = _mask_to_turns(left, win_sec, speaker=1) + _mask_to_turns(right, win_sec, speaker=2)
+        turns.sort(key=lambda t: t["start"])
+        return turns or None
     except InterruptedError:
         raise
     except Exception as e:
