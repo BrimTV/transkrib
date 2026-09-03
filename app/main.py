@@ -4,6 +4,7 @@ import errno
 import functools
 import json
 import os
+import pathlib
 import subprocess
 import sys
 import threading
@@ -34,6 +35,24 @@ def _ensure_utf8_console():
 def _ui_path():
     base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, "app", "ui", "index.html")
+
+
+def _ui_url():
+    """Адрес страницы с меткой версии.
+
+    Окно кеширует страницы file:// по адресу, и адрес после обновления программы
+    остаётся прежним: человек получал старый интерфейс поверх нового движка, а на
+    своей машине этого не видно, пока не почистишь кеш системы. Метка делает
+    адрес другим при каждой версии. Из исходников версия меняется редко, поэтому
+    там берём время правки файла."""
+    path = _ui_path()
+    stamp = __version__
+    if not getattr(sys, "frozen", False):
+        try:
+            stamp += "-" + str(int(os.path.getmtime(path)))
+        except OSError:
+            pass
+    return pathlib.Path(path).as_uri() + "?v=" + urllib.parse.quote(stamp)
 
 
 def _settings_path():
@@ -732,6 +751,18 @@ def _run_smoke(argv):
         except Exception as e:
             lines.append(f"FAIL: {e}")
         try:
+            # Мост библиотеки жив и без нашего кода: ошибка в index.html не мешает
+            # pywebview.api.info() ответить, и до этой проверки сломанный интерфейс
+            # доехал бы до людей. Спрашиваем именно наши функции.
+            # Без callback: он вызывается только для промисов, а простое выражение
+            # pywebview возвращает значением (на промисе мы бы ждали впустую).
+            alive = window.evaluate_js(
+                "(typeof onDropped === 'function' && typeof window.onEngineEvent === 'function'"
+                " && !!document.querySelector('#dropTr'))")
+            lines.append("UI" if alive else f"FAIL: интерфейс не загрузился ({alive!r})")
+        except Exception as e:
+            lines.append(f"FAIL: проверка интерфейса {e}")
+        try:
             # Синтетический drop без файлов: проверяет, что подписка _wire_dnd
             # жива и _on_drop реально вызывается (см. A0) — путей не будет,
             # это нормально, дословный путь проверяется только руками (Г4).
@@ -744,9 +775,9 @@ def _run_smoke(argv):
             lines.append(f"FAIL: dnd dispatch {e}")
         if hold > 0:
             time.sleep(hold)
-        finish(0 if ok.is_set() else 2)
+        finish(0 if ok.is_set() and "UI" in lines else 2)
 
-    window = webview.create_window(f"Transkrib {__version__}", _ui_path(), js_api=api,
+    window = webview.create_window(f"Transkrib {__version__}", _ui_url(), js_api=api,
                                    width=1100, height=740, background_color="#111418")
     api._window = window
     window.events.loaded += api._wire_dnd
@@ -767,7 +798,7 @@ def _run_smoke(argv):
 
     threading.Thread(target=watchdog, daemon=True).start()
     webview.start(private_mode=False, storage_path=_webview_storage_path())
-    return 0 if ok.is_set() else 2
+    return 0 if ok.is_set() and "UI" in lines else 2
 
 
 def main():
@@ -849,7 +880,7 @@ def main():
 
     import webview
     api = Api()
-    window = webview.create_window(f"Transkrib {__version__}", _ui_path(), js_api=api,
+    window = webview.create_window(f"Transkrib {__version__}", _ui_url(), js_api=api,
                                    width=1100, height=740, min_size=(820, 560),
                                    background_color="#111418")
     api._window = window

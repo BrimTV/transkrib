@@ -308,7 +308,7 @@ jobs:
           if (-not (Test-Path $log)) { throw "smoke.log не появился, код выхода $($p.ExitCode)" }
           Get-Content $log
           if ($p.ExitCode -ne 0) { throw "окно не открылось, код $($p.ExitCode)" }
-          foreach ($needle in @("READY", "OK", "DND_DISPATCHED")) {
+          foreach ($needle in @("READY", "OK", "UI", "DND_DISPATCHED")) {
             if (-not (Select-String -Path $log -Pattern $needle -Quiet)) { throw "в smoke.log нет $needle" }
           }
           Write-Host "OK: окно, мост и перетаскивание живы"
@@ -320,7 +320,7 @@ jobs:
           ./dist/Transkrib.app/Contents/MacOS/Transkrib-console --smoke
           log="$HOME/Library/Application Support/Transkrib/smoke.log"
           cat "$log"
-          for needle in READY OK DND_DISPATCHED; do
+          for needle in READY OK UI DND_DISPATCHED; do
             grep -q "$needle" "$log" || { echo "в smoke.log нет $needle"; exit 1; }
           done
           echo "OK: окно, мост и перетаскивание живы"
