@@ -157,8 +157,10 @@ jobs:
           ditto -x -k "$ZIP_NAME" archive_check
           test -f "archive_check/Transkrib/ЧИТАЙ.txt" || { echo "ЧИТАЙ.txt отсутствует в архиве"; exit 1; }
           test -x "archive_check/Transkrib/Transkrib.app/Contents/MacOS/Transkrib" || { echo "приложение отсутствует в архиве"; exit 1; }
-          codesign --verify --deep archive_check/Transkrib/Transkrib.app || { echo "подпись не прошла проверку"; exit 1; }
-          echo "OK: приложение, инструкция и подпись на месте"
+          # Проверяет целостность после cp -R и ditto, а не то, пустит ли Gatekeeper:
+          # подпись «для себя» его всё равно не устраивает, это описано в ЧИТАЙ.txt.
+          codesign --verify --deep archive_check/Transkrib/Transkrib.app || { echo "подпись повреждена при упаковке"; exit 1; }
+          echo "OK: приложение и инструкция на месте, подпись пережила упаковку"
 
       # ── Проверки собранного пакета (Windows) ──────────────────────────────
       # Всё ниже нельзя перепроверить на маке разработчиков — это единственное
@@ -358,13 +360,22 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Checkout строго первым: он считает непустой рабочий каталог без .git чужим
+      # и вычищает его целиком. Скачанные до него архивы просто исчезли бы, а
+      # релиз всё равно вышел бы — с описанием и нулём файлов для скачивания.
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: out
           merge-multiple: true
-      - uses: actions/checkout@v4
+      - name: Все четыре архива на месте
+        run: |
+          ls -la out/
+          test "$(ls out/*.zip | wc -l)" -eq 4 || { echo "ожидалось 4 архива"; exit 1; }
       - uses: softprops/action-gh-release@v2
         with:
           files: out/*.zip
           body_path: build/RELEASE-NOTES.md
           generate_release_notes: true
+          # Иначе пропажа архивов проходит предупреждением, а релиз выходит пустым.
+          fail_on_unmatched_files: true

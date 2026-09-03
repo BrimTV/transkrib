@@ -51,9 +51,9 @@ def test_длинный_файл_сначала_слушается_кускам�
     calls = []
     original = media._channel_envelopes
 
-    def spy(src, total_sec, cancel=None, limit_sec=None, seek=None):
+    def spy(src, total_sec, cancel=None, limit_sec=None, seek=None, on_progress=None):
         calls.append((limit_sec, None if seek is None else round(seek, 1)))
-        return original(src, total_sec, cancel, limit_sec, seek)
+        return original(src, total_sec, cancel, limit_sec, seek, on_progress)
 
     monkeypatch.setattr(media, "_channel_envelopes", spy)
     turns = media.stereo_turns(str(stereo_call_wav), 22.0)
@@ -82,10 +82,18 @@ def test_обычное_стерео_не_декодируется_целико�
     calls = []
     original = media._channel_envelopes
 
-    def spy(src, total_sec, cancel=None, limit_sec=None, seek=None):
+    def spy(src, total_sec, cancel=None, limit_sec=None, seek=None, on_progress=None):
         calls.append(limit_sec)
-        return original(src, total_sec, cancel, limit_sec, seek)
+        return original(src, total_sec, cancel, limit_sec, seek, on_progress)
 
     monkeypatch.setattr(media, "_channel_envelopes", spy)
     assert media.stereo_turns(str(stereo_same_wav), 22.0) is None
     assert calls == [4.0, 4.0], "после отказа на пробе полного разбора быть не должно"
+
+
+def test_эхо_не_выдаётся_за_второго_собеседника(stereo_echo_wav):
+    """Справа тихая копия левого канала, попавшая ровно в паузу: каналы звучат
+    строго по очереди, и по одной этой примете запись неотличима от звонка.
+    Второго человека там нет — способ обязан отказаться, иначе человеку скажут
+    «разделил по каналам, это точнее», а разметят эхо."""
+    assert media.stereo_turns(str(stereo_echo_wav), 22.0) is None

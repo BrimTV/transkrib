@@ -234,22 +234,35 @@ class Api:
 
     def _on_drop(self, kind, e):
         files = (e.get("dataTransfer") or {}).get("files") or []
-        paths = [f["pywebviewFullPath"] for f in files if f.get("pywebviewFullPath")]
-        if files and not paths:
-            paths = self._recover_dropped_paths(files)
-            if paths:
-                engine.log(f"dnd: {kind} путь восстановлен по списку окна ({len(paths)})")
-        if not paths:
-            # Путь подставляет сама библиотека окна, сопоставляя имя файла из
-            # события с тем, что она собрала при перетаскивании. Если и запасное
-            # сопоставление не помогло — пишем оба списка: без них причину
-            # («не долетело событие» против «имена разошлись») не отличить.
-            engine.log(f"dnd: {kind} путей нет; имена из события={[f.get('name') for f in files]}; "
-                       f"собрано окном={[n for n, _ in self._window_dnd_paths()]}")
+        # Список забираем один раз и целиком: он нужен и для восстановления, и для
+        # записи в лог, а второе чтение вернуло бы уже пустой.
+        collected = self._window_dnd_paths(consume=True)
+        paths, missing = [], []
+        for f in files:
+            p = f.get("pywebviewFullPath")
+            if p:
+                paths.append(p)
+            else:
+                missing.append(f)
+
+        lost = 0
+        if missing:
+            # Пофайлово, а не «всё или ничего»: библиотека сопоставляет имена по
+            # одному, и в одном перетаскивании часть путей может дойти, а часть
+            # (кириллица в разложенной форме) — потеряться.
+            recovered = self._recover_dropped_paths(missing, collected)
+            paths.extend(recovered)
+            lost = len(missing) - len(recovered)
+            engine.log(f"dnd: {kind} путей нет у {len(missing)} из {len(files)}, "
+                       f"восстановлено {len(recovered)}; "
+                       f"имена из события={[f.get('name') for f in missing]}; "
+                       f"собрано окном={[n for n, _ in collected]}")
         else:
             engine.log(f"dnd: {kind} paths={len(paths)}")
-        paths, skipped = self._expand_dropped(paths)
-        self._emit(dict(type="dropped", target=kind, paths=paths, skipped=skipped))
+
+        paths, skipped, truncated = self._expand_dropped(paths)
+        self._emit(dict(type="dropped", target=kind, paths=paths, skipped=skipped,
+                        lost=lost, truncated=truncated, limit=self._DROP_LIMIT))
 
     # Столько файлов берём из перетащенных папок за раз. Больше — это уже не
     # «закинул записи», а случайно брошенный Рабочий стол: очередь из тысячи
@@ -267,7 +280,7 @@ class Api:
         аудио и не видео, откладываем и сообщаем числом — молча проглатывать
         нельзя, человек будет искать пропавший файл.
 
-        Возвращает (пути, сколько пропущено)."""
+        Возвращает (пути, сколько пропущено, упёрлись ли в предел)."""
         out, skipped = [], 0
         for p in paths:
             if os.path.isdir(p):
@@ -284,13 +297,13 @@ class Api:
                         if media.is_media(full):
                             out.append(full)
                         if len(out) >= cls._DROP_LIMIT:
-                            engine.log(f"dnd: взято первых {cls._DROP_LIMIT} файлов из папки")
-                            return out, skipped
+                            engine.log(f"dnd: взято первых {cls._DROP_LIMIT} файлов")
+                            return out, skipped, True
             elif media.is_media(p):
                 out.append(p)
             else:
                 skipped += 1
-        return out, skipped
+        return out, skipped, False
 
     @staticmethod
     def _window_dnd_paths(consume=False):
@@ -315,7 +328,7 @@ class Api:
             engine.log(f"dnd: список окна недоступен: {exc}")
             return []
 
-    def _recover_dropped_paths(self, files):
+    def _recover_dropped_paths(self, files, collected):
         """Запасное сопоставление, когда pywebviewFullPath пуст.
 
         Библиотека сравнивает имена дословно, а macOS отдаёт кириллицу в
@@ -325,7 +338,6 @@ class Api:
         Берём только хвост списка длиной в число перетащенных файлов: свежие
         записи library добавляет в конец, а всё, что осталось от прошлых
         перетаскиваний, лежит перед ними."""
-        collected = self._window_dnd_paths(consume=True)
         if not collected or len(collected) < len(files):
             return []
         tail = collected[-len(files):]

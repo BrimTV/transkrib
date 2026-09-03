@@ -31,6 +31,7 @@ def api(monkeypatch):
         monkeypatch.setattr(Api, "_window_dnd_paths", staticmethod(fake))
 
     a.store = store
+    a._recover = lambda files: a._recover_dropped_paths(files, a._window_dnd_paths(consume=True))
 
     a.collected = collected
     return a
@@ -39,59 +40,59 @@ def api(monkeypatch):
 def test_имена_совпадают_дословно(api):
     api.collected([("a.mp3", "/tmp/a.mp3"), ("b.wav", "/tmp/b.wav")])
     files = [{"name": "b.wav"}, {"name": "a.mp3"}]
-    assert api._recover_dropped_paths(files) == ["/tmp/b.wav", "/tmp/a.mp3"]
+    assert api._recover(files) == ["/tmp/b.wav", "/tmp/a.mp3"]
 
 
 def test_разная_форма_записи_юникода(api):
     имя = "Рисерч катрин.mp3"
     api.collected([(unicodedata.normalize("NFD", имя), "/tmp/" + имя)])
-    assert api._recover_dropped_paths([{"name": unicodedata.normalize("NFC", имя)}]) == ["/tmp/" + имя]
+    assert api._recover([{"name": unicodedata.normalize("NFC", имя)}]) == ["/tmp/" + имя]
 
 
 def test_имя_в_процентах(api):
     api.collected([("%D0%B7%D0%B2%D1%83%D0%BA.mp3", "/tmp/звук.mp3")])
-    assert api._recover_dropped_paths([{"name": "звук.mp3"}]) == ["/tmp/звук.mp3"]
+    assert api._recover([{"name": "звук.mp3"}]) == ["/tmp/звук.mp3"]
 
 
 def test_регистр_не_мешает(api):
     api.collected([("Запись.MP3", "/tmp/Запись.MP3")])
-    assert api._recover_dropped_paths([{"name": "запись.mp3"}]) == ["/tmp/Запись.MP3"]
+    assert api._recover([{"name": "запись.mp3"}]) == ["/tmp/Запись.MP3"]
 
 
 def test_имена_не_сошлись_но_число_совпало(api):
     # Последняя надежда: событие и список — из одного перетаскивания, значит порядок тот же.
     api.collected([("что-то.mp3", "/tmp/что-то.mp3")])
-    assert api._recover_dropped_paths([{"name": "совсем другое"}]) == ["/tmp/что-то.mp3"]
+    assert api._recover([{"name": "совсем другое"}]) == ["/tmp/что-то.mp3"]
 
 
 def test_путей_меньше_чем_файлов(api):
     # Угадывать нельзя: возьмём не тот файл — человек молча получит чужую расшифровку.
     api.collected([("a.mp3", "/tmp/a.mp3")])
-    assert api._recover_dropped_paths([{"name": "x"}, {"name": "y"}]) == []
+    assert api._recover([{"name": "x"}, {"name": "y"}]) == []
 
 
 def test_остатки_прошлого_перетаскивания_не_подставляются(api):
     """Библиотека окна не удаляет из своего списка то, что не сумела сопоставить,
     и он копится. Берём только хвост длиной в число перетащенных файлов."""
     api.collected([("старое.mp3", "/tmp/старое.mp3"), ("новое.mp3", "/tmp/новое.mp3")])
-    assert api._recover_dropped_paths([{"name": "не сошлось"}]) == ["/tmp/новое.mp3"]
+    assert api._recover([{"name": "не сошлось"}]) == ["/tmp/новое.mp3"]
 
 
 def test_список_очищается_после_разбора(api):
     api.collected([("a.mp3", "/tmp/a.mp3")])
-    assert api._recover_dropped_paths([{"name": "a.mp3"}]) == ["/tmp/a.mp3"]
+    assert api._recover([{"name": "a.mp3"}]) == ["/tmp/a.mp3"]
     assert api.store == [], "разобранное и устаревшее должно уйти из списка"
-    assert api._recover_dropped_paths([{"name": "a.mp3"}]) == []
+    assert api._recover([{"name": "a.mp3"}]) == []
 
 
 def test_окно_ничего_не_собрало(api):
     api.collected([])
-    assert api._recover_dropped_paths([{"name": "a.mp3"}]) == []
+    assert api._recover([{"name": "a.mp3"}]) == []
 
 
 def test_два_одинаковых_имени_из_разных_папок(api):
     api.collected([("a.mp3", "/one/a.mp3"), ("a.mp3", "/two/a.mp3")])
-    assert api._recover_dropped_paths([{"name": "a.mp3"}, {"name": "a.mp3"}]) == ["/one/a.mp3", "/two/a.mp3"]
+    assert api._recover([{"name": "a.mp3"}, {"name": "a.mp3"}]) == ["/one/a.mp3", "/two/a.mp3"]
 
 
 def test_в_мосте_нет_открытых_полей():
@@ -115,7 +116,7 @@ def test_папка_разворачивается_в_записи(tmp_path):
     (tmp_path / ".служебная").mkdir()
     (tmp_path / ".служебная" / "запись3.mp3").write_bytes(b"x")
 
-    пути, пропущено = Api._expand_dropped([str(tmp_path)])
+    пути, пропущено, _ = Api._expand_dropped([str(tmp_path)])
     assert [os.path.basename(p) for p in пути] == ["запись1.mp3", "запись2.wav"]
     assert пропущено == 0, "файлы внутри папки не считаем пропущенными, их никто не выбирал"
 
@@ -125,7 +126,7 @@ def test_не_медиа_файл_считается_пропущенным(tmp_
     док.write_bytes(b"x")
     звук = tmp_path / "речь.m4a"
     звук.write_bytes(b"x")
-    пути, пропущено = Api._expand_dropped([str(док), str(звук)])
+    пути, пропущено, _ = Api._expand_dropped([str(док), str(звук)])
     assert пути == [str(звук)]
     assert пропущено == 1
 
@@ -134,7 +135,7 @@ def test_из_папки_берётся_не_больше_предела(tmp_pat
     monkeypatch.setattr(Api, "_DROP_LIMIT", 3)
     for i in range(10):
         (tmp_path / f"{i}.mp3").write_bytes(b"x")
-    пути, _ = Api._expand_dropped([str(tmp_path)])
+    пути, _, _ = Api._expand_dropped([str(tmp_path)])
     assert len(пути) == 3
 
 
@@ -147,5 +148,30 @@ def test_папка_с_точкой_в_имени_не_считается_слу
     пакет.mkdir()
     (пакет / "спрятано.mp3").write_bytes(b"x")
 
-    пути, _ = Api._expand_dropped([str(tmp_path)])
+    пути, _, _ = Api._expand_dropped([str(tmp_path)])
     assert [os.path.basename(p) for p in пути] == ["часть1.mp3"]
+
+
+def test_часть_путей_дошла_часть_нет(api):
+    """Библиотека сопоставляет имена по одному: в одном перетаскивании часть
+    путей доходит, часть теряется. Пропавшие обязаны восстановиться, а не
+    утянуть за собой дошедшие."""
+    api.collected([("кириллица.mp3", "/tmp/кириллица.mp3")])
+    files = [{"name": "latin.mp3", "pywebviewFullPath": "/tmp/latin.mp3"},
+             {"name": "кириллица.mp3"}]
+    пути, missing = [], []
+    for f in files:
+        (пути if f.get("pywebviewFullPath") else missing).append(f)
+    восстановлено = api._recover(missing)
+    assert восстановлено == ["/tmp/кириллица.mp3"]
+
+
+def test_предел_папки_сообщается_отдельно(tmp_path, monkeypatch):
+    monkeypatch.setattr(Api, "_DROP_LIMIT", 2)
+    for i in range(5):
+        (tmp_path / f"{i}.mp3").write_bytes(b"x")
+    пути, пропущено, обрезано = Api._expand_dropped([str(tmp_path)])
+    assert len(пути) == 2 and пропущено == 0 and обрезано is True
+
+    пути, пропущено, обрезано = Api._expand_dropped([str(tmp_path / "0.mp3")])
+    assert обрезано is False

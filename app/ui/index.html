@@ -296,14 +296,21 @@ document.addEventListener('drop', e => e.preventDefault());
 wireDrop($('#dropTr'), addToQueue);
 wireDrop($('#dropCv'), addToConvert);
 function onDropped(e) {
-  // Пропущенное считает Python: он один видит, что лежит в перетащенной папке.
-  // Молчать про это нельзя — человек будет искать файл, которого нет в очереди.
-  const skipped = e.skipped || 0;
+  // Считает всё это Python: он один видит, что лежит в перетащенной папке и чей
+  // путь не удалось определить. Молчать про пропажу нельзя — человек будет
+  // искать в очереди файл, которого там нет.
+  const notes = [];
+  if (e.truncated) notes.push(`взято первых ${e.limit} файлов`);
+  if (e.skipped) notes.push(e.skipped === 1 ? 'один файл не аудио и не видео'
+                                            : `не аудио и не видео: ${e.skipped}`);
+  if (e.lost) notes.push(e.lost === 1 ? 'у одного файла не удалось определить путь'
+                                      : `не удалось определить путь у ${e.lost}`);
   if (e.paths && e.paths.length) {
     (e.target === 'convert' ? addToConvert : addToQueue)(e.paths);
-    if (skipped) toast(skipped === 1 ? 'Один файл пропущен: это не аудио и не видео'
-                                     : `Пропущено файлов: ${skipped} — это не аудио и не видео`);
-  } else if (skipped) {
+    if (notes.length) toast('Добавлено ' + e.paths.length + ', ' + notes.join(', '));
+  } else if (e.lost) {
+    toast('Не удалось получить путь к файлу — нажмите на область и выберите файл');
+  } else if (notes.length) {
     toast('Среди перетащенного нет аудио и видео');
   } else {
     toast('Не удалось получить путь к файлу — нажмите на область и выберите файл');

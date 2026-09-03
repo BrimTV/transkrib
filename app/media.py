@@ -152,8 +152,10 @@ def probe_info(path):
     channels — для В6 (звонки по каналам): None, если распознать не удалось
     (непривычная раскладка вроде 5.1) — это безопасный дефолт: «не знаем,
     не пробуем канальный способ», а не «считаем, что канал один»."""
+    # timeout обязателен: файл может лежать на сетевой шаре или в облаке, и без
+    # него «Остановить» в этот момент не сработает — окно ждёт чтения метаданных.
     proc = subprocess.run([ffmpeg_exe(), "-hide_banner", "-i", path], capture_output=True,
-                          text=True, encoding="utf-8", errors="replace", **_NO_WINDOW)
+                          text=True, encoding="utf-8", errors="replace", timeout=30, **_NO_WINDOW)
     err = proc.stderr or ""
     m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", err)
     duration = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)) if m else None
@@ -386,6 +388,10 @@ def _mask_to_turns(active, win_sec, speaker, min_gap=0.5, min_dur=0.5):
 # Порог взаимоисключаемости каналов: выше — собеседники звучат по очереди, то есть
 # сидят в разных каналах; ниже — обычная стереозапись, где оба канала звучат вместе.
 _STEREO_EXCLUSIVITY = 0.7
+# Насколько канал обязан вести в своих окнах и насколько близкими должны быть
+# громкости обоих голосов. Эхо и панорама одного микрофона отсеиваются именно тут.
+_STEREO_LEAD_DB = 8.0
+_STEREO_LEVEL_GAP_DB = 12.0
 # Пробная выборка: решать «звонок по каналам или обычная запись» по всему файлу
 # незачем — это лишнее полное декодирование на каждом файле, который окажется
 # обычным стерео. Слушаем три куска по минуте, разнесённые по записи: только по
@@ -394,11 +400,22 @@ _STEREO_PROBE_SEC = 60.0
 _STEREO_PROBE_AT = (0.05, 0.45, 0.8)
 
 
-def _channel_envelopes(src, total_sec, cancel=None, limit_sec=None, seek=None):
-    """Маски «канал звучит» по окнам 100 мс для левого и правого канала.
-    Возвращает (левая, правая, длина окна в секундах) или None."""
+def _channel_envelopes(src, total_sec, cancel=None, limit_sec=None, seek=None, on_progress=None):
+    """Громкость левого и правого канала в децибелах по окнам 100 мс.
+    Возвращает (левый, правый, длина окна в секундах) или None. Решение о том,
+    что считать звучанием, принимается выше: порог зависит от самой записи."""
     import numpy as np
     from . import engine  # лениво — engine.py на верхнем уровне импортирует этот модуль
+
+    part_sec = min(total_sec or 0, limit_sec or total_sec or 0) or None
+    if part_sec:
+        # 8 кГц стерео 16 бит — 32000 байт в секунду. Место проверяем сами:
+        # check_readable считал только моно-файл для распознавания и про этот
+        # второй ничего не знает.
+        free = shutil.disk_usage(engine.temp_dir()).free
+        if free < part_sec * 32000 * 1.2:
+            _log("stereo: не хватает места на диске под разбор каналов, пропускаю")
+            return None
 
     tmp_dir = tempfile.mkdtemp(prefix="transkrib_stereo_", dir=engine.temp_dir())
     try:
@@ -411,8 +428,8 @@ def _channel_envelopes(src, total_sec, cancel=None, limit_sec=None, seek=None):
             args = ["-t", str(limit_sec)] + args
         if seek:
             args = ["-ss", str(seek)] + args
-        _run(args + [wav], total_sec=min(total_sec or 0, limit_sec or total_sec or 0) or None,
-             cancel=cancel)
+        _run(args + [wav], total_sec=part_sec if on_progress else None,
+             on_progress=on_progress, cancel=cancel)
 
         with wave.open(wav, "rb") as w:
             sr = w.getframerate()
@@ -440,24 +457,56 @@ def _channel_envelopes(src, total_sec, cancel=None, limit_sec=None, seek=None):
         rms = np.concatenate(rms_parts)  # (окон, 2)
         with np.errstate(divide="ignore"):
             db = 20 * np.log10(np.maximum(rms, 1e-9))  # относительно полной шкалы int16
-        active = db > -40.0
-        return active[:, 0], active[:, 1], win / sr
+        return db[:, 0], db[:, 1], win / sr
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _looks_like_two_channel_call(left, right):
-    """Каналы звучат по очереди и в обоих есть речь — похоже на звонок, где
-    собеседники физически разложены по каналам."""
+def _active_masks(db_left, db_right):
+    """Маски «канал звучит». Порог не абсолютный, а от уровня самой записи:
+    тихая телефонная запись целиком лежит ниже любого фиксированного порога, и с
+    ним способ по каналам молча не применялся бы к ровно тем записям, где он
+    нужнее всего. Речь поднимается над собственным фоном примерно на 25 дБ."""
     import numpy as np
+    louder = np.maximum(db_left, db_right)
+    speech = float(np.percentile(louder, 95))
+    thr = min(max(speech - 25.0, -55.0), -30.0)
+    return db_left > thr, db_right > thr
+
+
+def _looks_like_two_channel_call(db_left, db_right):
+    """Похоже ли, что собеседники физически разложены по каналам.
+
+    Мало проверить, что каналы звучат по очереди: ровно так же выглядит эхо.
+    Комната, спикерфон и аппаратное псевдостерео дают во втором канале
+    задержанную копию первого — она попадает как раз в его паузы. Отличаем по
+    громкости: живой собеседник звучит примерно так же, как первый, а эхо
+    заметно тише. Ошибиться сюда дорого: sherpa не вызывается, отката нет, и
+    человеку при этом сообщается, что стало точнее."""
+    import numpy as np
+    left, right = _active_masks(db_left, db_right)
     n = len(left)
     both = int(np.sum(left & right))
     either = int(np.sum(left | right))
-    if either == 0 or n == 0:
+    if n == 0 or either == 0:
         return False
     if 1.0 - both / either <= _STEREO_EXCLUSIVITY:
         return False  # оба канала звучат вместе — обычная стереозапись, не звонок
-    return left.sum() >= 0.05 * n and right.sum() >= 0.05 * n
+    if left.sum() < 0.05 * n or right.sum() < 0.05 * n:
+        return False  # один канал почти всегда молчит — не диалог
+
+    only_l, only_r = left & ~right, right & ~left
+    if not only_l.any() or not only_r.any():
+        return False
+    # В своих окнах канал должен вести с заметным отрывом: иначе это один и тот
+    # же звук, слегка разведённый по панораме.
+    if (np.median(db_left[only_l] - db_right[only_l]) < _STEREO_LEAD_DB
+            or np.median(db_right[only_r] - db_left[only_r]) < _STEREO_LEAD_DB):
+        return False
+    # И оба голоса должны быть сопоставимой громкости: эхо тише живого голоса.
+    loud_l = float(np.percentile(db_left[only_l], 90))
+    loud_r = float(np.percentile(db_right[only_r], 90))
+    return abs(loud_l - loud_r) <= _STEREO_LEVEL_GAP_DB
 
 
 def _probe_looks_like_call(src, total_sec, cancel=None):
@@ -481,19 +530,18 @@ def _probe_looks_like_call(src, total_sec, cancel=None):
     return _looks_like_two_channel_call(np.concatenate(lefts), np.concatenate(rights))
 
 
-def stereo_turns(src, total_sec, cancel=None):
+def stereo_turns(src, total_sec, cancel=None, on_progress=None):
     """Записи Zoom, Telegram и телефонных приложений часто держат собеседников
     в разных каналах стерео — тогда разделять голоса через sherpa-onnx не
     нужно и вредно (медленнее и ошибается там, где канал уже сказал, кто есть
     кто). Смотрим на громкость левого и правого канала по окнам и, если они
-    звучат по очереди, строим turns того же вида, что диаризация
-    (app.diarize._finalize), без вызова sherpa. Говорящие нумеруются с 1, как
-    у диаризации, — UI и экспорт не отличают один способ от другого.
+    звучат по очереди и сопоставимо громко, строим turns того же вида, что
+    диаризация (app.diarize._finalize), без вызова sherpa. Говорящие нумеруются
+    с 1, как у диаризации, — UI и экспорт не отличают один способ от другого.
 
     Возвращает None, если способ не подходит (моно, обычная стереозапись с
-    одним микрофоном, тишина) — тогда вызывающая сторона идёт обычным путём
-    через sherpa. Любая осечка (ffmpeg не смог, файл не вскрылся) — тоже None,
-    а не исключение: это эвристика для ускорения, а не обязательный шаг."""
+    одним микрофоном, эхо вместо второго голоса, тишина) — тогда вызывающая
+    сторона идёт обычным путём через sherpa."""
     try:
         if probe_info(src)["channels"] != 2:
             return None
@@ -504,14 +552,19 @@ def stereo_turns(src, total_sec, cancel=None):
             if not _probe_looks_like_call(src, total_sec, cancel):
                 return None
 
-        env = _channel_envelopes(src, total_sec, cancel)
+        env = _channel_envelopes(src, total_sec, cancel, on_progress=on_progress)
         if env is None or not _looks_like_two_channel_call(env[0], env[1]):
             return None
-        left, right, win_sec = env
+        db_left, db_right, win_sec = env
+        left, right = _active_masks(db_left, db_right)
         turns = _mask_to_turns(left, win_sec, speaker=1) + _mask_to_turns(right, win_sec, speaker=2)
         turns.sort(key=lambda t: t["start"])
         return turns or None
     except InterruptedError:
+        raise
+    except UserError:
+        # Кончилось место, файл занят другой программой — это человеку надо знать
+        # дословно, а не «говорящие не разделились». Наверх, в карточку файла.
         raise
     except Exception as e:
         _log(f"stereo_turns: способ по каналам не подошёл ({e})")

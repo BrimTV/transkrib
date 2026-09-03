@@ -129,6 +129,21 @@ def stereo_same_wav(tmp_path_factory, speech_ru_10s):
 
 
 @pytest.fixture(scope="session")
+def stereo_echo_wav(tmp_path_factory, speech_ru_10s):
+    """Слева речь 0–10 с, справа её же тихая копия 11–21 с: так выглядит эхо
+    комнаты или спикерфона, попавшее ровно в паузу. Каналы звучат строго по
+    очереди — по одной этой примете эхо неотличимо от второго собеседника, и
+    отличает его только громкость (В6)."""
+    path = tmp_path_factory.mktemp("fixtures") / "stereo_echo.wav"
+    _ffmpeg("-i", str(speech_ru_10s), "-i", str(speech_ru_10s), "-filter_complex",
+            "[0:a]apad=whole_dur=22[left];"
+            "[1:a]adelay=11000,volume=-18dB,apad=whole_dur=22[right];"
+            "[left][right]amerge=inputs=2[out]",
+            "-map", "[out]", "-ac", "2", "-ar", "16000", str(path))
+    return path
+
+
+@pytest.fixture(scope="session")
 def multitrack_mkv(tmp_path_factory):
     """Видео с двумя независимыми аудиодорожками (как в записях OBS)."""
     path = tmp_path_factory.mktemp("fixtures") / "multitrack.mkv"

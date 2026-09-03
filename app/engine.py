@@ -975,12 +975,22 @@ def transcribe_file(src, model_key, language, emit, cancel=None, prefer_gpu=True
                 # микрофоном) — media.stereo_turns сама вернёт None, идём обычным путём.
                 # Если человек прямо указал число голосов и оно не два, канальный
                 # способ заведомо не то, что просили: в каналах их всегда двое.
-                turns = None if num_speakers not in (0, 2) else media.stereo_turns(src, total_sec, cancel)
+                turns = None
+                if num_speakers in (0, 2):
+                    # Стадию объявляем заранее: на длинной записи разбор каналов
+                    # занимает десятки секунд, и без строки на экране это выглядит
+                    # как зависание сразу после «текст готов».
+                    emit(dict(type="stage", stage="diarize",
+                              msg="Текст готов, смотрю, записаны ли собеседники в разные каналы"))
+                    turns = media.stereo_turns(
+                        src, total_sec, cancel,
+                        on_progress=lambda p: emit(dict(type="diar_progress", progress=p)))
                 if turns is not None:
                     n = len({t["speaker"] for t in turns})
                     log(f"стерео-звонок: говорящие разложены по каналам ({n}), sherpa не вызываю")
                     emit(dict(type="stage", stage="diarize", note=True,
-                              msg="Собеседники записаны в разные каналы — разделил по ним, это точнее и быстрее"))
+                              msg="Похоже, собеседники записаны в разные каналы — разделил по ним, "
+                                  "это точнее и быстрее"))
                     emit(dict(type="speakers", turns=turns, count=n))
                 else:
                     # После текста, а не параллельно: на 8 ГБ два движка разом выбивали MLX

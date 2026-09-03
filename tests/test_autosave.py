@@ -25,7 +25,7 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setattr(engine, "data_dir", lambda: str(data_dir))
     monkeypatch.setattr(main, "_documents_dir", lambda: str(docs_dir))
     a = main.Api()
-    a.window = None
+    a._window = None
     return a
 
 
