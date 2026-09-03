@@ -6,4 +6,4 @@ import os
 # готовую строку в TRANSKRIB_VERSION перед сборкой — при теге vX.Y.Z это сам тег,
 # иначе база ниже плюс короткий хеш коммита (см. .github/workflows/build.yml).
 # Без переменной (сборка из исходников на своей машине) используется база как есть.
-__version__ = os.environ.get("TRANSKRIB_VERSION") or "0.1.0"
+__version__ = os.environ.get("TRANSKRIB_VERSION") or "0.2.0"
