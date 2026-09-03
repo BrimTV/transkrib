@@ -5,6 +5,7 @@
 браузера — в собранной, строки не совпадают, и путь до нас не доходит. Здесь
 проверяется запасное сопоставление (app/main.py: Api._recover_dropped_paths).
 """
+import os
 import unicodedata
 
 import pytest
@@ -115,7 +116,7 @@ def test_папка_разворачивается_в_записи(tmp_path):
     (tmp_path / ".служебная" / "запись3.mp3").write_bytes(b"x")
 
     пути, пропущено = Api._expand_dropped([str(tmp_path)])
-    assert [p.rsplit("/", 1)[-1] for p in пути] == ["запись1.mp3", "запись2.wav"]
+    assert [os.path.basename(p) for p in пути] == ["запись1.mp3", "запись2.wav"]
     assert пропущено == 0, "файлы внутри папки не считаем пропущенными, их никто не выбирал"
 
 
