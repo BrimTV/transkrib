@@ -122,7 +122,7 @@ jobs:
         shell: pwsh
         run: |
           Copy-Item build\README-windows.txt dist\ЧИТАЙ.txt
-          $zip = "Transkrib-${{ matrix.variant }}.zip"
+          $zip = "Transkrib-${{ matrix.variant }}-windows.zip"
           7z a -tzip -mx=3 -mcu=on $zip .\dist\Transkrib .\dist\ЧИТАЙ.txt | Out-Null
           Get-Item $zip | Select-Object Name, @{n="MB";e={[math]::Round($_.Length/1MB)}}
           echo "ZIP_NAME=$zip" >> $env:GITHUB_ENV
@@ -138,7 +138,7 @@ jobs:
           rm -rf pack && mkdir -p pack/Transkrib
           cp -R dist/Transkrib.app pack/Transkrib/
           cp build/README-macos.txt pack/Transkrib/ЧИТАЙ.txt
-          zip="Transkrib-${{ matrix.variant }}-${{ matrix.name }}.zip"
+          zip="Transkrib-${{ matrix.variant }}-mac.zip"
           ditto -c -k --sequesterRsrc --keepParent pack/Transkrib "$zip"
           ls -la Transkrib-*.zip
           echo "ZIP_NAME=$zip" >> "$GITHUB_ENV"
@@ -355,7 +355,9 @@ jobs:
         with:
           path: out
           merge-multiple: true
+      - uses: actions/checkout@v4
       - uses: softprops/action-gh-release@v2
         with:
           files: out/*.zip
+          body_path: build/RELEASE-NOTES.md
           generate_release_notes: true

@@ -37,12 +37,12 @@ faster-whisper как CPU-путь, резка длинных записей п�
 или Releases для тегов `v*`).
 
 **Windows.** Сначала снять пометку «из интернета» в свойствах архива, затем распаковать
-`Transkrib-lite.zip` (или `medium`) **целиком** и запустить `Transkrib\Transkrib.exe`.
+`Transkrib-lite-windows.zip` (или `medium`) **целиком** и запустить `Transkrib\Transkrib.exe`.
 Подробности в `ЧИТАЙ.txt` внутри архива.
 Нужен Windows 10/11 с WebView2 (есть в системе по умолчанию). CUDA ставить не надо,
 библиотеки внутри. При первом запуске SmartScreen может спросить: «Подробнее → Выполнить в любом случае».
 
-**macOS (Apple Silicon).** Распаковать `Transkrib-lite-macos-arm64.zip` (или `medium`),
+**macOS (Apple Silicon).** Распаковать `Transkrib-lite-mac.zip` (или `medium`),
 перетащить `Transkrib.app` в Программы. Подробности — в `ЧИТАЙ.txt` рядом с приложением.
 
 Приложение не подписано сертификатом разработчика, поэтому при первом запуске macOS скажет,
