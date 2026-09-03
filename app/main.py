@@ -251,13 +251,24 @@ class Api:
         self._emit(dict(type="dropped", target=kind, paths=paths))
 
     @staticmethod
-    def _window_dnd_paths():
+    def _window_dnd_paths(consume=False):
         """Список (имя, путь), который библиотека окна собрала при перетаскивании.
-        Приватная деталь pywebview, поэтому под try: пропажа ключа не должна
-        ронять обработчик — без него просто не сработает запасной путь."""
+        consume=True забирает его себе и очищает.
+
+        Чистить обязательно: библиотека удаляет из этого списка только то, что
+        сама сопоставила с файлом, а всё несопоставленное остаётся там навсегда
+        и копится от перетаскивания к перетаскиванию. Если этим не управлять,
+        запасное сопоставление ниже однажды подставит человеку файл из прошлого
+        раза — молча и с виду правдоподобно.
+
+        Приватная деталь pywebview, поэтому под try: её пропажа не должна ронять
+        обработчик — просто не сработает запасной путь."""
         try:
             from webview.dom import _dnd_state
-            return list(_dnd_state.get("paths") or [])
+            paths = list(_dnd_state.get("paths") or [])
+            if consume:
+                del _dnd_state["paths"][:]
+            return paths
         except Exception as exc:
             engine.log(f"dnd: список окна недоступен: {exc}")
             return []
@@ -266,19 +277,22 @@ class Api:
         """Запасное сопоставление, когда pywebviewFullPath пуст.
 
         Библиотека сравнивает имена дословно, а macOS отдаёт кириллицу в
-        разложенной форме (и→и+‌знак), браузер же — в собранной: строки разные,
-        файл «не найден», путь теряется. Сравниваем нормализованно, а если имена
-        всё равно не сошлись, но файлов ровно столько же, сколько собрало окно, —
-        берём по порядку: событие и список формируются из одного перетаскивания."""
-        collected = self._window_dnd_paths()
-        if not collected:
+        разложенной форме (и+знак), браузер же — в собранной: строки разные,
+        файл «не найден», путь теряется. Сравниваем нормализованно.
+
+        Берём только хвост списка длиной в число перетащенных файлов: свежие
+        записи library добавляет в конец, а всё, что осталось от прошлых
+        перетаскиваний, лежит перед ними."""
+        collected = self._window_dnd_paths(consume=True)
+        if not collected or len(collected) < len(files):
             return []
+        tail = collected[-len(files):]
 
         def norm(x):
             return unicodedata.normalize("NFC", os.path.basename(x or "")).casefold()
 
         by_name = {}
-        for name, path in collected:
+        for name, path in tail:
             by_name.setdefault(norm(urllib.parse.unquote(name)), []).append(path)
         out, matched = [], True
         for f in files:
@@ -289,9 +303,9 @@ class Api:
                 matched = False
         if matched and out:
             return out
-        if len(files) == len(collected):
-            return [path for _, path in collected]
-        return []
+        # Имена не сошлись совсем: событие и хвост списка — из одного
+        # перетаскивания, значит порядок тот же.
+        return [path for _, path in tail]
 
     # ── справочная информация ────────────────────────────────────────────
     def info(self):

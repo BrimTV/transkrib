@@ -16,8 +16,20 @@ from app.main import Api
 def api(monkeypatch):
     a = Api()
 
+    store = []
+
     def collected(pairs):
-        monkeypatch.setattr(Api, "_window_dnd_paths", staticmethod(lambda: list(pairs)))
+        store[:] = list(pairs)
+
+        def fake(consume=False):
+            out = list(store)
+            if consume:
+                store[:] = []
+            return out
+
+        monkeypatch.setattr(Api, "_window_dnd_paths", staticmethod(fake))
+
+    a.store = store
 
     a.collected = collected
     return a
@@ -51,10 +63,24 @@ def test_имена_не_сошлись_но_число_совпало(api):
     assert api._recover_dropped_paths([{"name": "совсем другое"}]) == ["/tmp/что-то.mp3"]
 
 
-def test_число_не_совпало_лучше_ничего(api):
+def test_путей_меньше_чем_файлов(api):
     # Угадывать нельзя: возьмём не тот файл — человек молча получит чужую расшифровку.
     api.collected([("a.mp3", "/tmp/a.mp3")])
     assert api._recover_dropped_paths([{"name": "x"}, {"name": "y"}]) == []
+
+
+def test_остатки_прошлого_перетаскивания_не_подставляются(api):
+    """Библиотека окна не удаляет из своего списка то, что не сумела сопоставить,
+    и он копится. Берём только хвост длиной в число перетащенных файлов."""
+    api.collected([("старое.mp3", "/tmp/старое.mp3"), ("новое.mp3", "/tmp/новое.mp3")])
+    assert api._recover_dropped_paths([{"name": "не сошлось"}]) == ["/tmp/новое.mp3"]
+
+
+def test_список_очищается_после_разбора(api):
+    api.collected([("a.mp3", "/tmp/a.mp3")])
+    assert api._recover_dropped_paths([{"name": "a.mp3"}]) == ["/tmp/a.mp3"]
+    assert api.store == [], "разобранное и устаревшее должно уйти из списка"
+    assert api._recover_dropped_paths([{"name": "a.mp3"}]) == []
 
 
 def test_окно_ничего_не_собрало(api):
