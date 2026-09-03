@@ -130,11 +130,28 @@ jobs:
       - name: Package (macOS)
         if: runner.os == 'macOS'
         run: |
+          # Подпись «для себя» (ad-hoc): без неё macOS считает приложение
+          # повреждённым. От предупреждения о непроверенном разработчике она не
+          # спасает — как его пройти, написано в ЧИТАЙ.txt, и он обязан лежать
+          # рядом с приложением, иначе человек упрётся в это на первом же запуске.
           codesign --force --deep -s - dist/Transkrib.app
+          rm -rf pack && mkdir -p pack/Transkrib
+          cp -R dist/Transkrib.app pack/Transkrib/
+          cp build/README-macos.txt pack/Transkrib/ЧИТАЙ.txt
           zip="Transkrib-${{ matrix.variant }}-${{ matrix.name }}.zip"
-          ditto -c -k --keepParent dist/Transkrib.app "$zip"
+          ditto -c -k --sequesterRsrc --keepParent pack/Transkrib "$zip"
           ls -la Transkrib-*.zip
           echo "ZIP_NAME=$zip" >> "$GITHUB_ENV"
+
+      - name: Проверка состава архива (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          rm -rf archive_check && mkdir archive_check
+          ditto -x -k "$ZIP_NAME" archive_check
+          test -f "archive_check/Transkrib/ЧИТАЙ.txt" || { echo "ЧИТАЙ.txt отсутствует в архиве"; exit 1; }
+          test -x "archive_check/Transkrib/Transkrib.app/Contents/MacOS/Transkrib" || { echo "приложение отсутствует в архиве"; exit 1; }
+          codesign --verify --deep archive_check/Transkrib/Transkrib.app || { echo "подпись не прошла проверку"; exit 1; }
+          echo "OK: приложение, инструкция и подпись на месте"
 
       # ── Проверки собранного пакета (Windows) ──────────────────────────────
       # Всё ниже нельзя перепроверить на маке разработчиков — это единственное
