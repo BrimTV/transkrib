@@ -9,6 +9,8 @@ import sys
 import threading
 import time
 import traceback
+import unicodedata
+import urllib.parse
 import webbrowser
 
 from . import __version__, engine, export, media
@@ -227,8 +229,63 @@ class Api:
     def _on_drop(self, kind, e):
         files = (e.get("dataTransfer") or {}).get("files") or []
         paths = [f["pywebviewFullPath"] for f in files if f.get("pywebviewFullPath")]
-        engine.log(f"dnd: {kind} paths={len(paths)}")
+        if files and not paths:
+            paths = self._recover_dropped_paths(files)
+            if paths:
+                engine.log(f"dnd: {kind} путь восстановлен по списку окна ({len(paths)})")
+        if not paths:
+            # Путь подставляет сама библиотека окна, сопоставляя имя файла из
+            # события с тем, что она собрала при перетаскивании. Если и запасное
+            # сопоставление не помогло — пишем оба списка: без них причину
+            # («не долетело событие» против «имена разошлись») не отличить.
+            engine.log(f"dnd: {kind} путей нет; имена из события={[f.get('name') for f in files]}; "
+                       f"собрано окном={[n for n, _ in self._window_dnd_paths()]}")
+        else:
+            engine.log(f"dnd: {kind} paths={len(paths)}")
         self._emit(dict(type="dropped", target=kind, paths=paths))
+
+    @staticmethod
+    def _window_dnd_paths():
+        """Список (имя, путь), который библиотека окна собрала при перетаскивании.
+        Приватная деталь pywebview, поэтому под try: пропажа ключа не должна
+        ронять обработчик — без него просто не сработает запасной путь."""
+        try:
+            from webview.dom import _dnd_state
+            return list(_dnd_state.get("paths") or [])
+        except Exception as exc:
+            engine.log(f"dnd: список окна недоступен: {exc}")
+            return []
+
+    def _recover_dropped_paths(self, files):
+        """Запасное сопоставление, когда pywebviewFullPath пуст.
+
+        Библиотека сравнивает имена дословно, а macOS отдаёт кириллицу в
+        разложенной форме (и→и+‌знак), браузер же — в собранной: строки разные,
+        файл «не найден», путь теряется. Сравниваем нормализованно, а если имена
+        всё равно не сошлись, но файлов ровно столько же, сколько собрало окно, —
+        берём по порядку: событие и список формируются из одного перетаскивания."""
+        collected = self._window_dnd_paths()
+        if not collected:
+            return []
+
+        def norm(x):
+            return unicodedata.normalize("NFC", os.path.basename(x or "")).casefold()
+
+        by_name = {}
+        for name, path in collected:
+            by_name.setdefault(norm(urllib.parse.unquote(name)), []).append(path)
+        out, matched = [], True
+        for f in files:
+            bucket = by_name.get(norm(f.get("name")))
+            if bucket:
+                out.append(bucket.pop(0))
+            else:
+                matched = False
+        if matched and out:
+            return out
+        if len(files) == len(collected):
+            return [path for _, path in collected]
+        return []
 
     # ── справочная информация ────────────────────────────────────────────
     def info(self):
@@ -554,10 +611,12 @@ def _run_smoke(argv):
         except (ValueError, IndexError):
             hold = 0.0
 
+    limit = 90.0 + hold
     log_path = os.path.join(engine.data_dir(), "smoke.log")
     lines = []
     ok = threading.Event()          # info() реально ответил
     loaded_flag = threading.Event()  # событие loaded вообще наступило
+    finished = threading.Event()     # штатный выход уже начался
 
     def write_log():
         with open(log_path, "w", encoding="utf-8") as f:
@@ -570,6 +629,7 @@ def _run_smoke(argv):
         # системный цикл событий (замечено на macOS: process.run() виснет
         # навсегда, хотя окно уже закрыто) — даём штатному выходу короткий
         # срок и подстраховываемся принудительным os._exit, иначе CI зависнет.
+        finished.set()
         write_log()
         try:
             window.destroy()
@@ -619,12 +679,17 @@ def _run_smoke(argv):
     window.events.loaded += on_loaded
 
     def watchdog():
-        # Срабатывает, только если сам loaded ни разу не наступил — иначе
-        # выходом уже занят finish().
-        if not loaded_flag.wait(90):
-            lines.append("FAIL: сторожевой таймер 90 с (loaded не наступил)")
-            write_log()
-            os._exit(2)
+        # Сторож абсолютный, а не «пока не наступил loaded»: зависнуть можно и
+        # после загрузки страницы — на evaluate_js, на закрытии окна, на чужом
+        # цикле событий. Проверка окна в CI однажды провисела шесть часов, потому
+        # что ждали только loaded. Любой исход, кроме штатного выхода, — os._exit.
+        if finished.wait(limit):
+            return
+        lines.append(f"FAIL: сторожевой таймер {limit:.0f} с "
+                     f"(loaded={'да' if loaded_flag.is_set() else 'нет'}, "
+                     f"мост={'да' if ok.is_set() else 'нет'})")
+        write_log()
+        os._exit(2)
 
     threading.Thread(target=watchdog, daemon=True).start()
     webview.start(private_mode=False, storage_path=_webview_storage_path())

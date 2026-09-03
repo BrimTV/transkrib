@@ -14,6 +14,9 @@ jobs:
   build:
     name: ${{ matrix.variant }} / ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    # Самая долгая честная сборка — около 15 минут. Потолок нужен не для скорости,
+    # а чтобы зависшее окно не крутилось шесть часов подряд на каждом варианте.
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -262,11 +265,23 @@ jobs:
       - name: Окно открывается и мост жив (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
+        timeout-minutes: 8
         run: |
-          & "dist\Transkrib\Transkrib-console.exe" --smoke
-          if ($LASTEXITCODE -ne 0) { throw "окно не открылось, код $LASTEXITCODE" }
+          # Не `& exe` напрямую: PowerShell ждал бы процесс без конца, а однажды он
+          # завис после загрузки страницы и сжёг шесть часов раннера. Ждём с
+          # ограничением, добиваем и всё равно читаем лог — по нему видно, докуда дошло.
           $log = "$env:LOCALAPPDATA\Transkrib\smoke.log"
+          Remove-Item $log -ErrorAction SilentlyContinue
+          $p = Start-Process -FilePath "dist\Transkrib\Transkrib-console.exe" -ArgumentList "--smoke" -PassThru -NoNewWindow
+          if (-not $p.WaitForExit(180000)) {
+            Write-Host "smoke не завершился за 180 с, снимаю процесс"
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            if (Test-Path $log) { Get-Content $log }
+            throw "окно не закрылось само за 180 с"
+          }
+          if (-not (Test-Path $log)) { throw "smoke.log не появился, код выхода $($p.ExitCode)" }
           Get-Content $log
+          if ($p.ExitCode -ne 0) { throw "окно не открылось, код $($p.ExitCode)" }
           foreach ($needle in @("READY", "OK", "DND_DISPATCHED")) {
             if (-not (Select-String -Path $log -Pattern $needle -Quiet)) { throw "в smoke.log нет $needle" }
           }
@@ -274,6 +289,7 @@ jobs:
 
       - name: Окно открывается и мост жив (macOS)
         if: runner.os == 'macOS'
+        timeout-minutes: 8
         run: |
           ./dist/Transkrib.app/Contents/MacOS/Transkrib-console --smoke
           log="$HOME/Library/Application Support/Transkrib/smoke.log"
